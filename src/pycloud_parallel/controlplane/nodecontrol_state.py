@@ -153,6 +153,7 @@ from pycloud_parallel.controlplane.resource_signals import (
     ResourceSignalStore,
     signals_to_dicts,
 )
+from pycloud_parallel.execution.dependency_failover import dependency_failure_reason, dependency_missing_module
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
 
@@ -775,43 +776,57 @@ class NodeControlState(NodeRuntimeBase):
             self._cv.notify_all()
         return failed_count
 
-    def _mark_service_dependency_failure_locked(self, session: ServiceSession, *, reason: str) -> None:
-        reason_text = str(reason or "dependency runtime error").strip() or "dependency runtime error"
-        if not reason_text.lower().startswith("dependency runtime error"):
-            reason_text = f"dependency runtime error: {reason_text}"
-        if session.status == pb2.SERVICE_STATUS_STOPPED and str(session.stop_reason or "").strip() == reason_text:
-            return
-        stop_executor = None
-        if self._executor_host is not None and bool(getattr(session, "executor_ready", False)):
-            stop_executor = (self._executor_host, str(session.service_id or ""), reason_text)
-        session.executor_ready = False
-        session.alive_workers = 0
-        session.degraded = False
-        session.status = pb2.SERVICE_STATUS_STOPPED
-        session.readiness = "failed"
-        session.readiness_reason = reason_text
-        session.stop_reason = reason_text
-        session.failure_at = utc_now()
-        session.lease_expire_at = session.failure_at
-        self._drop_create_requests_for_resource_locked(kind="service", resource_id=session.service_id)
-        self._publish_resource_failure_locked(
+    def _mark_service_dependency_failure_locked(self, session: ServiceSession, *, reason: str, method: str = "") -> None:
+        normalized_method = str(method or "").strip() or "<unknown>"
+        reason_text = dependency_failure_reason(reason, method=normalized_method)
+        now = utc_now()
+        failures = dict(getattr(session, "method_failures", {}) or {})
+        previous = dict(failures.get(normalized_method) or {})
+        failures[normalized_method] = {
+            "method": normalized_method,
+            "reason": reason_text,
+            "error": str(reason or ""),
+            "missing_module": dependency_missing_module(reason),
+            "failure_at": now.isoformat(),
+            "count": int(previous.get("count", 0) or 0) + 1,
+        }
+        session.method_failures = failures
+        session.degraded = True
+        session.readiness = "ready"
+        session.readiness_reason = f"method dependency failure: {normalized_method}"
+        session.failure_at = now
+        self._publish_resource_signal_locked(
             resource_kind="service",
             resource_id=session.service_id,
+            signal_type="failure",
+            state="method_dependency_failed",
             reason=reason_text,
-            stage="runtime_dependency_failure",
-            payload={"error_category": "dependency"},
+            payload={
+                "stage": f"method_dependency_failure:{normalized_method}",
+                "error_category": "dependency",
+                "method": normalized_method,
+                "missing_module": dependency_missing_module(reason),
+                "method_failures": failures,
+            },
         )
-        if stop_executor is not None:
-            executor_host, service_id, stop_reason = stop_executor
-            self._submit_stop_service(executor_host, service_id=service_id, reason=stop_reason)
         self.request_infocenter_sync()
 
     def _mark_task_pool_dependency_failure_locked(self, pool: TaskPoolState, *, reason: str) -> None:
-        reason_text = str(reason or "dependency runtime error").strip() or "dependency runtime error"
-        if not reason_text.lower().startswith("dependency runtime error"):
-            reason_text = f"dependency runtime error: {reason_text}"
+        method_name = str(getattr(pool, "task_method", "") or "").strip() or "run"
+        reason_text = dependency_failure_reason(reason, method=method_name)
         if str(pool.status or "").upper() == "STOPPED" and str(pool.stop_reason or "").strip() == reason_text:
             return
+        failures = dict(getattr(pool, "method_failures", {}) or {})
+        previous = dict(failures.get(method_name) or {})
+        failures[method_name] = {
+            "method": method_name,
+            "reason": reason_text,
+            "error": str(reason or ""),
+            "missing_module": dependency_missing_module(reason),
+            "failure_at": utc_now().isoformat(),
+            "count": int(previous.get("count", 0) or 0) + 1,
+        }
+        pool.method_failures = failures
         stop_executor = None
         if self._executor_host is not None and bool(getattr(pool, "executor_ready", False)):
             stop_executor = (self._executor_host, str(pool.pool_id or ""), reason_text)
@@ -832,7 +847,12 @@ class NodeControlState(NodeRuntimeBase):
             resource_id=pool.pool_id,
             reason=reason_text,
             stage="runtime_dependency_failure",
-            payload={"error_category": "dependency"},
+            payload={
+                "error_category": "dependency",
+                "method": method_name,
+                "missing_module": dependency_missing_module(reason),
+                "method_failures": failures,
+            },
         )
         if stop_executor is not None:
             executor_host, pool_id, stop_reason = stop_executor
@@ -1903,7 +1923,7 @@ class NodeControlState(NodeRuntimeBase):
             try:
                 resp = executor_host.prepare_artifact(
                     artifact_spec=artifact_spec,
-                    timeout_sec=60.0,
+                    timeout_sec=600.0,
                     scope=prepare_scope,
                     key=prepare_key,
                 )
@@ -5031,7 +5051,11 @@ class NodeControlState(NodeRuntimeBase):
                         error_type=normalized_error_type,
                         error_message=normalized_error_message,
                     )
-                    self._mark_service_dependency_failure_locked(session, reason=normalized_error_message)
+                    self._mark_service_dependency_failure_locked(
+                        session,
+                        reason=normalized_error_message,
+                        method=requested_method,
+                    )
             return 503, {
                 "ok": False,
                 "method": requested_method,
@@ -5267,7 +5291,11 @@ class NodeControlState(NodeRuntimeBase):
                         error_message=(normalized_error_message if status_text != "SUCCEEDED" else ""),
                     )
                     if status_text == DEPENDENCY_FAILURE_STATUS:
-                        self._mark_service_dependency_failure_locked(session, reason=normalized_error_message)
+                        self._mark_service_dependency_failure_locked(
+                            session,
+                            reason=normalized_error_message,
+                            method=requested_method,
+                        )
             yield self._encode_stream_line(done_event)
 
         return StreamingHttpResponse(status_code=200, body_iter=_iter_stream())
@@ -6012,17 +6040,20 @@ class NodeControlState(NodeRuntimeBase):
                 and bool(getattr(session, "executor_ready", False))
                 and int(getattr(session, "worker_count", 0) or 0) > 0
             ):
+                previous_alive = int(getattr(session, "alive_workers", 0) or 0)
+                session.alive_workers = 0
                 last_report_at = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
                 if now_monotonic - last_report_at >= 60.0:
                     session.last_liveness_missing_report_at = now_monotonic
                     logger.warning(
                         "[NodeControl] resource worker liveness missing "
-                        "node_id=%s node_instance_id=%s resource_kind=service resource_id=%s worker_count=%s alive_workers=%s",
+                        "node_id=%s node_instance_id=%s resource_kind=service resource_id=%s worker_count=%s "
+                        "previous_alive_workers=%s alive_workers=0 handling=owner_disconnect_signal",
                         self.node_id,
                         self.node_instance_id,
                         service_id,
                         int(getattr(session, "worker_count", 0) or 0),
-                        int(getattr(session, "alive_workers", 0) or 0),
+                        previous_alive,
                     )
         for pool_id, pool in self._task_pools.items():
             if ("task_pool", str(pool_id or "")) in seen:
@@ -6032,23 +6063,29 @@ class NodeControlState(NodeRuntimeBase):
                 and bool(getattr(pool, "executor_ready", False))
                 and int(getattr(pool, "worker_count", 0) or 0) > 0
             ):
+                previous_alive = int(getattr(pool, "alive_workers", 0) or 0)
+                pool.alive_workers = 0
                 last_report_at = float(getattr(pool, "last_liveness_missing_report_at", 0.0) or 0.0)
                 if now_monotonic - last_report_at >= 60.0:
                     pool.last_liveness_missing_report_at = now_monotonic
                     logger.warning(
                         "[NodeControl] resource worker liveness missing "
-                        "node_id=%s node_instance_id=%s resource_kind=task_pool resource_id=%s worker_count=%s alive_workers=%s",
+                        "node_id=%s node_instance_id=%s resource_kind=task_pool resource_id=%s worker_count=%s "
+                        "previous_alive_workers=%s alive_workers=0 handling=owner_disconnect_signal",
                         self.node_id,
                         self.node_instance_id,
                         pool_id,
                         int(getattr(pool, "worker_count", 0) or 0),
-                        int(getattr(pool, "alive_workers", 0) or 0),
+                        previous_alive,
                     )
 
     def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
         if session.status != pb2.SERVICE_STATUS_RUNNING:
             return
 
+        # Worker liveness is telemetry for the owner. NodeControl stops owner-managed
+        # resources only when the owner heartbeat lease expires; the owner applies the
+        # zero-alive 100s disconnect/blacklist/compensation policy.
         if not bool(getattr(session, "node_managed", False)) and now > session.lease_expire_at:
             self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
             return
@@ -6060,6 +6097,8 @@ class NodeControlState(NodeRuntimeBase):
         if not pool.is_running():
             return
 
+        # Same boundary as Service: zero worker liveness is reported upward; local
+        # cleanup is driven by the owner heartbeat lease, not by telemetry alone.
         if now > pool.lease_expire_at:
             self._stop_task_pool_resource_locked(
                 pool,

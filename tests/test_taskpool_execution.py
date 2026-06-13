@@ -3143,6 +3143,192 @@ def test_task_pool_compensation_replaces_retryable_failed_same_node(monkeypatch)
         session.close()
 
 
+def test_task_pool_compensation_blacklists_permanent_create_failure_node_id(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node_old = SimpleNamespace(
+        node_instance_id="node-bad-old",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50061",
+    )
+    node_new = SimpleNamespace(
+        node_instance_id="node-bad-new",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50062",
+    )
+    calls = []
+    nodes_by_attempt = [[node_old], [node_new]]
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return nodes_by_attempt[min(len(calls), len(nodes_by_attempt) - 1)]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            calls.append((self.target, dict(kwargs)))
+            raise RuntimeError("ModuleNotFoundError: No module named 'missing_pool_pkg'")
+
+    session = TaskPool(
+        pools={},
+        nodes={},
+        task_method="run",
+        job_id="job-create-blacklist",
+    )
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "owner_client_id": "owner-demo",
+            "pool_name": "demo-pool",
+            "blob": b"def run(**kwargs):\n    return kwargs\n",
+            "runtime": "py3",
+            "entry_module": "task_demo",
+            "entry_callable": "run",
+            "package_format": "",
+            "deps": None,
+            "managed_global_names": [],
+            "initial_globals": {},
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "chunk_size": 1024,
+            "healthy_only": True,
+            "tags": [],
+            "node_ids": [],
+            "node_instance_ids": [],
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+            "api_token": "",
+        }
+    )
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    try:
+        assert session.try_compensate_replicas() == 0
+        assert session.try_compensate_replicas() == 0
+        assert [target for target, _kwargs in calls] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+        assert session._create_failure_node_blacklist["node-bad-old"].startswith("category=import_error")  # noqa: SLF001
+        assert "missing_module=missing_pool_pkg" in session._create_failure_node_blacklist["node-bad-old"]  # noqa: SLF001
+        assert session._create_failure_node_blacklist["node-bad-new"].startswith("category=import_error")  # noqa: SLF001
+    finally:
+        session.close()
+
+
+def test_task_pool_repeated_zero_alive_disconnect_blacklists_node_instance(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    pool = SimpleNamespace(
+        kind="task_pool",
+        pool_id="pool-zero",
+        pool_name="pool-zero",
+        worker_count=1,
+        alive_workers=0,
+        heartbeat_timeout_sec=30,
+        status="RUNNING",
+        readiness="ready",
+    )
+    session = TaskPool(pools={"node-1": pool}, nodes={}, task_method="run", job_id="job-zero")
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    try:
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+        assert session._active_replica_snapshot() == {"node-1"}  # noqa: SLF001
+        now[0] += 101.0
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+        assert session._active_replica_snapshot() == set()  # noqa: SLF001
+        assert "node-1" not in session._create_failure_node_blacklist  # noqa: SLF001
+
+        session._discard_terminal_replica("node-1")  # noqa: SLF001
+        session._add_active_replica("node-1")  # noqa: SLF001
+        session._zero_alive_started_at.pop("node-1", None)  # noqa: SLF001
+        now[0] += 10.0
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+        now[0] += 101.0
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+        assert "node-1" in session._create_failure_node_blacklist  # noqa: SLF001
+        assert "repeat zero-alive disconnect" in session._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+    finally:
+        session.close()
+
+
+def test_task_pool_repeated_owner_node_disconnect_blacklists_node_instance(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    pool = SimpleNamespace(
+        kind="task_pool",
+        pool_id="pool-disconnect",
+        pool_name="pool-disconnect",
+        worker_count=1,
+        alive_workers=1,
+        heartbeat_timeout_sec=30,
+        heartbeat_failure_threshold=1,
+        status="RUNNING",
+        readiness="ready",
+    )
+    session = TaskPool(pools={"node-1": pool}, nodes={}, task_method="run", job_id="job-disconnect")
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    try:
+        session._record_heartbeat_failure("node-1", pool, TimeoutError("cannot connect"))  # noqa: SLF001
+        assert "node-1" not in session._create_failure_node_blacklist  # noqa: SLF001
+        assert "node-1" in session._retry_probe_replica_snapshot()  # noqa: SLF001
+
+        session._discard_retry_probe_replica("node-1")  # noqa: SLF001
+        session._discard_terminal_replica("node-1")  # noqa: SLF001
+        session._add_active_replica("node-1")  # noqa: SLF001
+        now[0] += 1800.0
+        session._record_heartbeat_failure("node-1", pool, TimeoutError("cannot connect again"))  # noqa: SLF001
+
+        assert "node-1" in session._create_failure_node_blacklist  # noqa: SLF001
+        assert "repeat owner-node disconnect" in session._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+        assert "node-1" not in session._active_replica_snapshot()  # noqa: SLF001
+        assert "node-1" in session._terminal_replica_ids  # noqa: SLF001
+    finally:
+        session.close()
+
+
+def test_task_pool_heartbeat_reported_method_failures_drive_owner_blacklist() -> None:
+    from pycloud_parallel import TaskPool
+
+    pool = SimpleNamespace(
+        kind="task_pool",
+        pool_id="pool-node",
+        pool_name="pool-node",
+        worker_count=1,
+        alive_workers=1,
+        heartbeat_timeout_sec=30,
+        status="RUNNING",
+        readiness="ready",
+        method_failures={"run": {"reason": "No module named 'missing_pool_pkg'"}},
+    )
+    session = TaskPool(pools={"node-1": pool}, nodes={}, task_method="run", job_id="job-node-report")
+
+    try:
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+
+        assert "node-1" not in session._active_replica_snapshot()  # noqa: SLF001
+        assert "node-1" in session._create_failure_node_blacklist  # noqa: SLF001
+        assert "missing_pool_pkg" in session._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+    finally:
+        session.close()
+
+
 def test_task_pool_keepalive_compensates_pool_not_running(monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
@@ -3179,10 +3365,14 @@ def test_task_pool_keepalive_compensates_pool_not_running(monkeypatch) -> None:
                 pool_id=f"new-pool-{len(created) + 1}",
                 pool_name=kwargs["pool_name"],
                 pool_token="token-new",
-                code_version="sha256:test",
-                worker_count=kwargs["worker_count"],
-                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
-                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1),
+                    code_version="sha256:test",
+                    worker_count=kwargs["worker_count"],
+                    heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                    alive_workers=kwargs["worker_count"],
+                    status="RUNNING",
+                    readiness="ready",
+                    method_failures={},
+                    heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1),
                 submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
                 pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
                 cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
@@ -3251,7 +3441,9 @@ def test_task_pool_keepalive_compensates_pool_not_running(monkeypatch) -> None:
     try:
         session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
         deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline and not created:
+        while time.monotonic() < deadline and (
+            not created or "node-inst-1" not in session._active_replica_ids  # noqa: SLF001
+        ):
             time.sleep(0.02)
         assert created
         assert session.failed is False
@@ -3330,6 +3522,46 @@ def test_native_task_pool_session_iter_and_collect_results_consume_incrementally
     second_batch = session.collect_results(timeout_sec=0.1)
     assert [item.task_id for item in second_batch] == ["task-3"]
     assert session._pending_task_ids == set()  # noqa: SLF001
+
+
+def test_native_task_pool_results_ignore_untrusted_node_before_task_id_match() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        pool_id = "pool-old"
+        kind = "task_pool"
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+            self.pull_count = 0
+            self._results = [
+                pb2.TaskResult(task_id="task-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1})),
+            ]
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            self.pull_count += 1
+            batch = self._results[:limit]
+            self._results = self._results[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    pool = _Pool()
+    session = TaskPool(
+        pools={"node-old": pool},
+        nodes={},
+        task_method="run",
+        job_id="job-untrusted-result",
+    )
+    session._pending_task_ids = {"task-1"}  # noqa: SLF001
+    session._pending_task_node_ids = {"task-1": "node-old"}  # noqa: SLF001
+    session._active_nodes.clear()  # noqa: SLF001
+    session._active_replica_ids.clear()  # noqa: SLF001
+
+    assert list(session.iter_results(max_count=1, timeout_sec=0.05, wait_ms=0)) == []
+    assert pool.pull_count == 0
+    assert session._pending_task_ids == {"task-1"}  # noqa: SLF001
 
 
 def test_native_task_pool_session_iter_data_materializes_per_result() -> None:
@@ -4602,6 +4834,65 @@ def test_native_task_pool_unordered_returns_index_and_result_or_none() -> None:
     ]
 
 
+def test_native_task_pool_imap_poll_ignores_untrusted_result_source_before_task_id() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+        pool_id = "pool-old"
+        kind = "task_pool"
+
+        def __init__(self) -> None:
+            self.pull_count = 0
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            self.pull_count += 1
+            return pb2.PullResultsResponse(
+                ok=True,
+                results=[
+                    pb2.TaskResult(
+                        task_id="task-late",
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"value": "late"}),
+                    )
+                ],
+                next_cursor="",
+            )
+
+    pool = _Pool()
+    session = TaskPool(
+        pools={"node-old": pool},
+        nodes={},
+        task_method="run",
+        job_id="job-imap-untrusted",
+    )
+    session._pending_task_ids = {"task-late"}  # noqa: SLF001
+    session._pending_task_node_ids = {"task-late": "node-old"}  # noqa: SLF001
+    session._active_nodes.clear()  # noqa: SLF001
+    session._active_replica_ids.clear()  # noqa: SLF001
+
+    completed, freed = session._poll_imap_results_once(  # noqa: SLF001
+        ordered_node_ids=["node-old"],
+        inflight_by_node={"node-old": 1},
+        disabled_submit_nodes=set(),
+        scheduler_failures={},
+        infra_failures_by_node={},
+        task_index_by_id={"task-late": 0},
+        max_infra_retries=0,
+        retry_backoff_ms=0,
+        wait_ms=0,
+    )
+
+    assert completed == []
+    assert freed == {}
+    assert pool.pull_count == 0
+    assert session._pending_task_ids == {"task-late"}  # noqa: SLF001
+
+
 def test_native_task_pool_imap_unordered_requeues_after_submit_failure_to_healthy_node() -> None:
     from pycloud_parallel import TaskPool
 
@@ -5168,6 +5459,84 @@ def test_native_task_pool_imap_unordered_retries_remote_infra_failure_result() -
     assert len(submitted_by_node["node-bad"]) == 1
     assert len(submitted_by_node["node-good"]) == 1
     assert session.task_retry_success_count == 1
+
+
+def test_native_task_pool_imap_unordered_blacklists_dependency_failure_node() -> None:
+    from pycloud_parallel import TaskPool
+
+    submitted_by_node = {"node-bad": [], "node-good": []}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            submitted_by_node[self.node_id].extend(item.task_id for item in tasks)
+            for item in tasks:
+                if self.node_id == "node-bad":
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_FAILED_INFRA,
+                            error=pb2.TaskError(type="DependencyError", message="No module named 'missing_pkg'"),
+                        )
+                    )
+                else:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"task_id": item.task_id}),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-bad": _Pool("node-bad"), "node-good": _Pool("node-good")},
+        nodes={},
+        task_method="run",
+        job_id="job-retry-dependency",
+    )
+
+    with patch(
+        "pycloud_parallel.execution.task_pool.select_one_candidate",
+        side_effect=lambda candidates, *, profile, state, round_robin_counter=0: (
+            next(candidate for candidate in candidates if candidate.id == "node-bad")
+            if "node-bad" in [candidate.id for candidate in candidates] and "node-bad" not in state.disabled_candidates
+            else next(candidate for candidate in candidates if candidate.id == "node-good")
+        ),
+    ):
+        out = list(
+            session.imap_unordered(
+                [{"value": 1}, {"value": 2}],
+                max_in_flight=1,
+                timeout_sec=0.2,
+                max_infra_retries=1,
+            )
+        )
+
+    assert len(submitted_by_node["node-bad"]) == 1
+    assert len(submitted_by_node["node-good"]) == 2
+    assert all(item[1]["task_id"] in submitted_by_node["node-good"] for item in out)
+    assert "node-bad" in session._method_node_blacklist["run"]  # noqa: SLF001
+    assert "node-bad" in session._create_failure_node_blacklist  # noqa: SLF001
+    assert "node-bad" not in session._active_replica_snapshot()  # noqa: SLF001
 
 
 def test_native_task_pool_imap_unordered_drops_late_result_from_lost_node() -> None:

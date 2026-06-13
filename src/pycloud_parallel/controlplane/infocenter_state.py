@@ -604,6 +604,81 @@ class InfoCenterState:
             return float(normalized_inflight) / float(normalized_workers)
         return (float(normalized_inflight) * normalized_ema) / float(normalized_workers)
 
+    @staticmethod
+    def _service_call_route_exclusion_reasons(
+        *,
+        is_healthy: bool,
+        state: NodeState,
+        svc: NodeServiceState,
+        effective_status: int,
+        method_filter: str,
+    ) -> List[Dict[str, object]]:
+        reasons: List[Dict[str, object]] = []
+        if not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain)):
+            if not is_healthy:
+                reasons.append({"code": "node_unhealthy", "reason": "node is not healthy or registration is stale"})
+            if bool(state.drain):
+                reasons.append({"code": "node_drain", "reason": "node is drained"})
+            if int(effective_status) != int(pb2.SERVICE_STATUS_RUNNING):
+                reasons.append(
+                    {
+                        "code": "resource_not_running",
+                        "reason": "service is not running",
+                        "status": int(effective_status),
+                    }
+                )
+        readiness = str(getattr(svc, "readiness", "") or "").strip().lower()
+        readiness_reason = str(getattr(svc, "readiness_reason", "") or "").strip()
+        explicit_resource_health = str(getattr(svc, "resource_health", "") or "").strip().lower()
+        explicit_status_text = str(getattr(svc, "status_text", "") or "").strip().upper()
+        method_failures = dict(getattr(svc, "method_failures", {}) or {})
+        has_method_failures = bool(method_failures)
+        stop_reason = str(getattr(svc, "stop_reason", "") or "").strip()
+        method_only_degraded = has_method_failures and not stop_reason and explicit_resource_health == "degraded"
+        explicit_degraded = (
+            explicit_resource_health in {"failed", "stopped", "node_lost"}
+            or (explicit_status_text == "DEGRADED" and not has_method_failures)
+            or (
+                bool(getattr(svc, "degraded", False))
+                and not method_only_degraded
+                and not has_method_failures
+            )
+            or bool(stop_reason)
+        )
+        if explicit_degraded:
+            reasons.append(
+                {
+                    "code": "resource_degraded",
+                    "reason": stop_reason or readiness_reason or explicit_resource_health or "resource is degraded",
+                    "resource_health": explicit_resource_health,
+                    "status_text": explicit_status_text,
+                }
+            )
+        if method_filter and method_filter in method_failures:
+            failure = method_failures.get(method_filter)
+            reason_text = "method has reported failures on this route"
+            if isinstance(failure, dict):
+                reason_text = str(failure.get("reason", "") or reason_text)
+            reasons.append(
+                {
+                    "code": "method_blocked",
+                    "reason": reason_text,
+                    "method": method_filter,
+                    "method_failure": dict(failure or {}) if isinstance(failure, dict) else failure,
+                }
+            )
+        if readiness and readiness != "ready" and not (
+            has_method_failures and readiness_reason.startswith("method dependency failure")
+        ):
+            reasons.append(
+                {
+                    "code": "not_ready",
+                    "reason": readiness_reason or f"readiness is {readiness}",
+                    "readiness": readiness,
+                }
+            )
+        return reasons
+
     def register_node_record(
         self,
         *,
@@ -1083,10 +1158,12 @@ class InfoCenterState:
         healthy_only: bool,
         limit: int,
         route_scope: str = "call",
+        method: str = "",
     ) -> List[Dict[str, object]]:
         now = utc_now()
         name_filter = service_name.strip()
         normalized_scope = str(route_scope or "call").strip().lower()
+        method_filter = str(method or "").strip()
         effective_limit = max(1, int(limit))
         with self._lock:
             candidate_node_ids = (
@@ -1114,19 +1191,12 @@ class InfoCenterState:
             )
             if healthy_only:
                 if normalized_scope == "call":
-                    readiness = str(getattr(svc, "readiness", "") or "").strip().lower()
-                    explicit_resource_health = str(getattr(svc, "resource_health", "") or "").strip().lower()
-                    explicit_status_text = str(getattr(svc, "status_text", "") or "").strip().upper()
-                    explicit_degraded = (
-                        explicit_resource_health in {"degraded", "failed", "stopped", "node_lost"}
-                        or explicit_status_text == "DEGRADED"
-                        or bool(getattr(svc, "degraded", False))
-                        or bool(str(getattr(svc, "stop_reason", "") or "").strip())
-                    )
-                    if (
-                        not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain))
-                        or explicit_degraded
-                        or (readiness and readiness != "ready")
+                    if self._service_call_route_exclusion_reasons(
+                        is_healthy=is_healthy,
+                        state=state,
+                        svc=svc,
+                        effective_status=effective_status,
+                        method_filter=method_filter,
                     ):
                         continue
                 elif normalized_scope == "owner_command":
@@ -1170,6 +1240,7 @@ class InfoCenterState:
                     "resource_health": resource_health,
                     "readiness": str(getattr(svc, "readiness", "") or ""),
                     "readiness_reason": str(getattr(svc, "readiness_reason", "") or ""),
+                    "method_failures": dict(getattr(svc, "method_failures", {}) or {}),
                     "create_stage": str(getattr(svc, "create_stage", "") or ""),
                     "operation_id": str(getattr(svc, "operation_id", "") or ""),
                     "operation_updated_at": getattr(svc, "operation_updated_at", None),
@@ -1231,6 +1302,105 @@ class InfoCenterState:
                 x["service_id"],
             ),
         )
+
+    def diagnose_service_routes(
+        self,
+        *,
+        service_name: str,
+        method: str = "",
+        healthy_only: bool = True,
+        limit: int = 500,
+    ) -> Dict[str, object]:
+        now = utc_now()
+        name_filter = service_name.strip()
+        method_filter = str(method or "").strip()
+        effective_limit = max(1, int(limit))
+        with self._lock:
+            candidate_node_ids = (
+                list(self._services_by_name.get(name_filter, ()))
+                if name_filter
+                else list(self._nodes.keys())
+            )
+            snapshots: List[tuple[bool, NodeState, NodeServiceState]] = []
+            for node_instance_id in candidate_node_ids:
+                state = self._nodes.get(node_instance_id)
+                if state is None:
+                    continue
+                self._fence_if_stale_locked(state, now=now)
+                is_healthy = self._node_is_healthy_locked(state, now=now)
+                for svc in state.services.values():
+                    if name_filter and svc.service_name != name_filter:
+                        continue
+                    snapshots.append((is_healthy, state, svc))
+        rows: List[Dict[str, object]] = []
+        included_count = 0
+        excluded_count = 0
+        for is_healthy, state, svc in snapshots:
+            effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
+                self._effective_service_state_locked(state, svc, now=now)
+            )
+            reasons = (
+                self._service_call_route_exclusion_reasons(
+                    is_healthy=is_healthy,
+                    state=state,
+                    svc=svc,
+                    effective_status=effective_status,
+                    method_filter=method_filter,
+                )
+                if healthy_only
+                else []
+            )
+            included = not reasons
+            if included:
+                included_count += 1
+            else:
+                excluded_count += 1
+            rows.append(
+                {
+                    "included": included,
+                    "excluded_reasons": reasons,
+                    "service_name": svc.service_name,
+                    "service_id": svc.service_id,
+                    "method": method_filter,
+                    "status": int(effective_status),
+                    "status_text": str(getattr(svc, "status_text", "") or status_text or ""),
+                    "resource_health": str(getattr(svc, "resource_health", "") or ""),
+                    "readiness": str(getattr(svc, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(svc, "readiness_reason", "") or ""),
+                    "stop_reason": str(getattr(svc, "stop_reason", "") or ""),
+                    "failure_at": getattr(svc, "failure_at", None),
+                    "method_failures": dict(getattr(svc, "method_failures", {}) or {}),
+                    "node_instance_id": state.node_instance_id,
+                    "node_id": state.node_id,
+                    "control_addr": state.control_addr,
+                    "node_healthy": is_healthy,
+                    "node_schedulable": bool(state.schedulable),
+                    "node_drain": bool(state.drain),
+                    "accept_service_deploy": bool(getattr(state, "accept_service_deploy", True)),
+                    "worker_count": int(getattr(svc, "worker_count", 0) or 0),
+                    "alive_workers": int(effective_alive or 0),
+                    "in_flight": int(effective_in_flight or 0),
+                    "lease_expire_at": effective_lease_expire_at,
+                    "stale": stale,
+                    "http_base_url": svc.http_base_url,
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                not bool(row.get("included")),
+                str(row.get("service_name", "")),
+                str(row.get("node_id", "")),
+                str(row.get("service_id", "")),
+            )
+        )
+        return {
+            "service_name": name_filter,
+            "method": method_filter,
+            "healthy_only": bool(healthy_only),
+            "included_count": included_count,
+            "excluded_count": excluded_count,
+            "routes": rows[:effective_limit],
+        }
 
     def list_nodes(self, *, healthy_only: bool, tags: Iterable[str], limit: int) -> List[NodeState]:
         now = utc_now()

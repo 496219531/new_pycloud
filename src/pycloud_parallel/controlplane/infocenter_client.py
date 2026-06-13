@@ -72,6 +72,7 @@ class InfoCenterNodeService:
     failure_at: Optional[datetime] = None
     readiness: str = ""
     readiness_reason: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     create_stage: str = ""
     operation_id: str = ""
     operation_updated_at: Optional[datetime] = None
@@ -98,6 +99,7 @@ class InfoCenterNodeTaskPool:
     failure_at: Optional[datetime] = None
     readiness: str = ""
     readiness_reason: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     create_stage: str = ""
     operation_id: str = ""
     operation_updated_at: Optional[datetime] = None
@@ -173,6 +175,7 @@ class InfoCenterServiceRoute:
     resource_health: str = ""
     readiness: str = ""
     readiness_reason: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     create_stage: str = ""
     operation_id: str = ""
     operation_updated_at: Optional[datetime] = None
@@ -295,6 +298,11 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     failure_at=_parse_optional_dt(svc.get("failure_at")),
                     readiness=str(svc.get("readiness", "") or ""),
                     readiness_reason=str(svc.get("readiness_reason", "") or ""),
+                    method_failures={
+                        str(k): dict(v)
+                        for k, v in dict(svc.get("method_failures") or {}).items()
+                        if isinstance(v, dict)
+                    },
                     create_stage=str(svc.get("create_stage", "") or ""),
                     operation_id=str(svc.get("operation_id", "") or ""),
                     operation_updated_at=_parse_optional_dt(svc.get("operation_updated_at")),
@@ -321,6 +329,11 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     stop_reason=str(pool.get("stop_reason", pool.get("failure_reason", "")) or ""),
                     failure_reason=str(pool.get("failure_reason", pool.get("stop_reason", "")) or ""),
                     failure_at=_parse_optional_dt(pool.get("failure_at")),
+                    method_failures={
+                        str(k): dict(v)
+                        for k, v in dict(pool.get("method_failures") or {}).items()
+                        if isinstance(v, dict)
+                    },
                     readiness=str(pool.get("readiness", "") or ""),
                     readiness_reason=str(pool.get("readiness_reason", "") or ""),
                     create_stage=str(pool.get("create_stage", "") or ""),
@@ -394,6 +407,7 @@ def _serialize_service_report_item(item: object) -> Dict[str, object]:
         ),
         "readiness": str(getattr(item, "readiness", "") or ""),
         "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+        "method_failures": dict(getattr(item, "method_failures", {}) or {}),
         "create_stage": str(getattr(item, "create_stage", "") or ""),
         "operation_id": str(getattr(item, "operation_id", "") or ""),
         "operation_updated_at": (
@@ -709,14 +723,16 @@ class InfoCenterClient:
         healthy_only: bool = True,
         limit: int = 500,
         route_scope: str = "call",
+        method: str = "",
     ) -> Sequence[InfoCenterServiceRoute]:
         
         params = "&".join(
             [
-                f"service_name={service_name}",
+                f"service_name={quote(str(service_name or ''), safe='')}",
                 f"healthy_only={'true' if healthy_only else 'false'}",
                 f"limit={max(1, int(limit))}",
-                f"route_scope={str(route_scope or '').strip()}",
+                f"route_scope={quote(str(route_scope or '').strip(), safe='')}",
+                f"method={quote(str(method or '').strip(), safe='')}",
             ]
         )
         resp = http_json_request(
@@ -764,6 +780,11 @@ class InfoCenterClient:
                     resource_health=str(item.get("resource_health", "") or ""),
                     readiness=str(item.get("readiness", "") or ""),
                     readiness_reason=str(item.get("readiness_reason", "") or ""),
+                    method_failures={
+                        str(k): dict(v)
+                        for k, v in dict(item.get("method_failures") or {}).items()
+                        if isinstance(v, dict)
+                    },
                     create_stage=str(item.get("create_stage", "") or ""),
                     operation_id=str(item.get("operation_id", "") or ""),
                     operation_updated_at=_parse_optional_dt(item.get("operation_updated_at")),
@@ -778,13 +799,42 @@ class InfoCenterClient:
         *,
         service_name: str = "",
         limit: int = 500,
+        method: str = "",
     ) -> Sequence[InfoCenterServiceRoute]:
         return self.list_service_routes(
             service_name=service_name,
             healthy_only=True,
             limit=limit,
             route_scope="call",
+            method=method,
         )
+
+    def diagnose_service_routes(
+        self,
+        *,
+        service_name: str = "",
+        method: str = "",
+        healthy_only: bool = True,
+        limit: int = 500,
+    ) -> Dict[str, object]:
+        params = "&".join(
+            [
+                f"service_name={quote(str(service_name or ''), safe='')}",
+                f"method={quote(str(method or '').strip(), safe='')}",
+                f"healthy_only={'true' if healthy_only else 'false'}",
+                f"limit={max(1, int(limit))}",
+            ]
+        )
+        resp = http_json_request(
+            base_url=self.base_url,
+            path=f"/services/routes/diagnose?{params}",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
+        diagnosis = resp.get("diagnosis", {})
+        if not isinstance(diagnosis, dict):
+            raise RuntimeError("invalid service route diagnosis response")
+        return dict(diagnosis)
 
     def node_status(self, control_addr: str) -> Dict[str, object]:
         resp = http_json_request(

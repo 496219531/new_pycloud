@@ -72,11 +72,14 @@ from pycloud_parallel.execution.managed_globals import update_managed_globals_ac
 from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter, is_progress_option
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
+    format_replica_create_failure,
+    is_permanent_replica_create_failure,
     normalize_initial_globals,
     prepare_deployment_artifact,
     run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
+from pycloud_parallel.execution.dependency_failover import dependency_failure_reason, dependency_missing_module
 from pycloud_parallel.execution.error_classifier import (
     ErrorCategory,
     classify_error,
@@ -113,8 +116,8 @@ def _taskpool_create_rpc_timeout_sec(timeout_sec: float) -> float:
     except (TypeError, ValueError):
         overall = 0.0
     if overall <= 0.0:
-        return 30.0
-    return max(10.0, min(30.0, overall * 3.0))
+        return 600.0
+    return max(10.0, overall)
 
 
 def _resolve_owner_api_token(api_token: str = "") -> str:
@@ -1115,6 +1118,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._replay_records: Dict[str, _TaskReplayRecord] = {}
         self._replay_node_index: Dict[str, Set[str]] = {}
         self._scheduler_state = SchedulerState()
+        self._method_node_blacklist: Dict[str, Dict[str, str]] = {}
         self._submit_breaker_states: Dict[str, CandidateBreakerState] = {
             str(node_id): CandidateBreakerState() for node_id in self._pools.keys()
         }
@@ -1128,6 +1132,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._compensation_lock = threading.Lock()
         self._last_compensation_attempt_at = 0.0
         self._last_compensation_decision_log_at = 0.0
+        # Owner-side blacklist covers create failures, runtime dependency failures,
+        # zero-alive disconnects, and repeated owner-node disconnects.
+        self._owner_node_blacklist: Dict[str, str] = {}
+        self._create_failure_node_blacklist = self._owner_node_blacklist
         self._last_managed_globals: Optional[Dict[str, object]] = None
         self._async_globals_lock = threading.Lock()
         self._async_globals_executor: Optional[ThreadPoolExecutor] = None
@@ -1205,6 +1213,47 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     @staticmethod
     def _is_retryable_compensation_failure(message: str) -> bool:
         return is_retryable_compensation_failure(message, resource_kind="task_pool")
+
+    def _mark_create_failure_node_blacklisted(self, node: InfoCenterNode, message: object) -> None:
+        if not is_permanent_replica_create_failure(message, resource_kind="task_pool"):
+            return
+        node_instance_id = _node_instance_key_from_node(node)
+        if not node_instance_id:
+            return
+        self._owner_node_blacklist[node_instance_id] = format_replica_create_failure(
+            message,
+            resource_kind="task_pool",
+        )
+
+    def _create_failure_node_block_reason(self, node: InfoCenterNode) -> str:
+        node_instance_id = _node_instance_key_from_node(node)
+        if not node_instance_id:
+            return ""
+        return str(self._owner_node_blacklist.get(node_instance_id, "") or "")
+
+    def _mark_replica_node_instance_blacklisted(self, node_instance_id: str, reason: str) -> None:
+        normalized = str(node_instance_id or "").strip()
+        if not normalized:
+            return
+        self._owner_node_blacklist[normalized] = str(reason or "").strip() or "replica unavailable"
+
+    def _mark_owner_node_instance_blacklisted(self, node_instance_id: str, reason: str) -> None:
+        normalized = str(node_instance_id or "").strip()
+        if not normalized:
+            return
+        self._owner_node_blacklist[normalized] = str(reason or "").strip() or "replica unavailable"
+        self.failures[normalized] = self._owner_node_blacklist[normalized]
+        pool = self._pools.get(normalized)
+        if pool is not None:
+            if hasattr(pool, "failed"):
+                pool.failed = True
+            if hasattr(pool, "last_error"):
+                pool.last_error = self._owner_node_blacklist[normalized]
+        self._discard_active_replica(normalized)
+        self._discard_retry_probe_replica(normalized)
+        self._mark_terminal_replica(normalized)
+        self._scheduler_state.disabled_candidates.add(normalized)
+        self._wake_keepalive()
 
     def _after_keepalive_tick(self) -> None:
         self._maybe_submit_compensation_after_tick(
@@ -1301,7 +1350,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 return 0
             excluded = deployed_active | (failed - retryable_failed)
             list_started_at = time.monotonic()
-            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
+            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0)) as infocenter:
                 selected_nodes = list(
                     infocenter.select_task_nodes(
                         healthy_only=bool(spec.get("healthy_only", True)),
@@ -1318,10 +1367,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             list_nodes_sec += time.monotonic() - list_started_at
             select_started_at = time.monotonic()
             raw_candidate_node_ids = [_node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)]
+            create_failure_blocked = {
+                _node_instance_key_from_node(node): self._create_failure_node_block_reason(node)
+                for node in selected_nodes
+                if self._create_failure_node_block_reason(node)
+            }
             candidates = [
                 node
                 for node in selected_nodes
                 if _node_instance_key_from_node(node) not in excluded
+                and not self._create_failure_node_block_reason(node)
             ]
             if deployed_active:
                 active_node_ids = {
@@ -1368,7 +1423,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         sorted(self._retry_probe_replica_snapshot()),
                         sorted(failed),
                         sorted(retryable_failed),
-                        "no eligible candidate",
+                        "owner node blacklist" if create_failure_blocked else "no eligible candidate",
                     )
                 return 0
             missing = max(0, desired - len(active))
@@ -1381,7 +1436,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 create_started_at = 0.0
                 try:
                     target = _node_control_target_for_node(node)
-                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0))
                     create_started_at = time.monotonic()
                     pool = client.create_task_pool_from_bytes(
                         owner_client_id=str(spec.get("owner_client_id", "") or ""),
@@ -1407,6 +1462,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                             )
                         ),
                         wait_ready=False,
+                        timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0),
                     )
                     create_rpc_sec += time.monotonic() - create_started_at
                 except Exception as exc:
@@ -1427,23 +1483,25 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 if error_message:
                     with self._pool_lock:
                         self.failures[node_key] = error_message
+                        self._mark_create_failure_node_blacklisted(node, error_message)
                     category = classify_error(error_message, resource_kind="task_pool").value
                     _mark_infocenter_node_lost_on_identity_mismatch(
                         infocenter_factory=_infocenter_client,
                         infocenter_target=str(spec["infocenter_target"]),
-                        timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0),
+                        timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0),
                         node_instance_id=node_key,
                         error_message=error_message,
                         reason_prefix="task pool compensation identity mismatch",
                     )
                     logger.warning(
                         "task pool dynamic compensation create failed pool_name=%s "
-                        "node_id=%s node_instance_id=%s control_addr=%s category=%s err=%s",
+                        "node_id=%s node_instance_id=%s control_addr=%s category=%s missing_module=%s err=%s",
                         spec.get("pool_name", ""),
                         getattr(node, "node_id", ""),
                         node_key,
                         getattr(node, "control_addr", ""),
                         category,
+                        dependency_missing_module(error_message),
                         error_message,
                     )
                     continue
@@ -1548,16 +1606,56 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return [
                 node_id
                 for node_id in ordered_node_ids
-                if node_id in active and self._pool_candidate_allowed(node_id)
+                if node_id in active and self._pool_candidate_allowed(node_id) and not self._is_task_method_node_blacklisted(node_id)
             ]
         if hasattr(self, "_active_replica_ids"):
             active = self._active_replica_snapshot()
             return [
                 node_id
                 for node_id in ordered_node_ids
-                if node_id in active and self._pool_candidate_allowed(node_id)
+                if node_id in active and self._pool_candidate_allowed(node_id) and not self._is_task_method_node_blacklisted(node_id)
             ]
-        return [node_id for node_id in ordered_node_ids if self._pool_candidate_allowed(node_id)]
+        return [
+            node_id
+            for node_id in ordered_node_ids
+            if self._pool_candidate_allowed(node_id) and not self._is_task_method_node_blacklisted(node_id)
+        ]
+
+    def _is_task_method_node_blacklisted(self, node_id: str) -> bool:
+        normalized_method = str(getattr(self, "_task_method", "") or "").strip() or "run"
+        return str(node_id or "").strip() in dict(self._method_node_blacklist.get(normalized_method, {}) or {})
+
+    def _mark_task_method_node_blacklisted(self, node_id: str, reason: object) -> None:
+        normalized_node = str(node_id or "").strip()
+        if not normalized_node:
+            return
+        normalized_method = str(getattr(self, "_task_method", "") or "").strip() or "run"
+        self._method_node_blacklist.setdefault(normalized_method, {})[normalized_node] = dependency_failure_reason(
+            reason,
+            method=normalized_method,
+        )
+        self._scheduler_state.disabled_candidates.add(normalized_node)
+        self._mark_owner_node_instance_blacklisted(
+            normalized_node,
+            self._method_node_blacklist[normalized_method][normalized_node],
+        )
+
+    def _on_replica_method_failures_reported(self, node_id: str, replica: object, method_failures: Dict[str, object]) -> None:
+        del replica
+        normalized_node = str(node_id or "").strip()
+        if not normalized_node or not method_failures:
+            return
+        normalized_method = str(getattr(self, "_task_method", "") or "").strip() or "run"
+        detail = dict(method_failures or {}).get(normalized_method)
+        if detail is None:
+            detail = next(iter(dict(method_failures or {}).values()), "dependency runtime error")
+        if isinstance(detail, dict):
+            raw_reason = str(detail.get("reason") or detail.get("error") or detail or "")
+        else:
+            raw_reason = str(detail or "")
+        reason_text = dependency_failure_reason(raw_reason or "dependency runtime error", method=normalized_method)
+        self._method_node_blacklist.setdefault(normalized_method, {})[normalized_node] = reason_text
+        self._mark_owner_node_instance_blacklisted(normalized_node, reason_text)
 
     def _pool_breaker_state(self, node_id: str) -> CandidateBreakerState:
         normalized = str(node_id or "").strip()
@@ -1985,7 +2083,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         job_id: str = "",
         task_id_prefix: str = "",
         timeout_hint_sec: int = 0,
@@ -2073,6 +2171,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def _is_pending_task_id(self, task_id: str) -> bool:
         with self._result_state_lock:
             return self._is_pending_task_id_unlocked(task_id)
+
+    def _can_accept_result_from_node(self, node_id: str) -> bool:
+        normalized = str(node_id or "").strip()
+        if not normalized:
+            return False
+        pool = self._pools.get(normalized)
+        if pool is None:
+            return False
+        if not self._is_current_replica(normalized, pool):
+            return False
+        active_snapshot = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else set(self._active_nodes)
+        retry_probe = self._retry_probe_replica_snapshot() if hasattr(self, "_retry_probe_replica_ids") else set()
+        return normalized in active_snapshot or normalized in retry_probe
 
     def _clear_pending_for_current_job(self) -> None:
         with self._result_state_lock:
@@ -2224,7 +2335,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -2270,6 +2381,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         break
                 poll_round += 1
             for node_id, pool in ordered_items:
+                if not self._can_accept_result_from_node(node_id):
+                    continue
                 per_pull_limit = max(1, int(limit or 100))
                 if remaining_by_max > 0:
                     per_pull_limit = max(1, min(per_pull_limit, remaining_by_max))
@@ -2309,7 +2422,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
@@ -2330,7 +2443,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
@@ -2353,7 +2466,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
@@ -2381,7 +2494,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
@@ -2461,7 +2574,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         max_count: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -2485,7 +2598,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         max_count: Optional[int] = None,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
@@ -2608,7 +2721,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         max_count: Optional[int] = None,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
@@ -2656,7 +2769,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         max_count: Optional[int] = None,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
@@ -2702,7 +2815,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         max_count: Optional[int] = None,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
@@ -2741,7 +2854,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             )
         )
 
-    def _collect_data_for_task_ids(self, task_ids: Set[str], *, timeout_sec: float = 30.0) -> List[Tuple[str, Any]]:
+    def _collect_data_for_task_ids(self, task_ids: Set[str], *, timeout_sec: float = 600.0) -> List[Tuple[str, Any]]:
         out: List[Tuple[str, Any]] = []
         for node_id, item in self._iter_raw_results(max_count=len(task_ids), timeout_sec=timeout_sec, task_ids=set(task_ids)):
             if int(item.status) != int(pb2.TASK_STATUS_SUCCEEDED):
@@ -2754,7 +2867,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         expected_count: int = 0,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
@@ -2824,7 +2937,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         expected_count: int = 0,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         progress: ProgressOption = False,
@@ -3282,6 +3395,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         for node_id in ordered_node_ids:
             if node_id in disabled_submit_nodes and int(inflight_by_node.get(node_id, 0) or 0) <= 0:
                 continue
+            if not self._can_accept_result_from_node(node_id):
+                continue
             pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
             per_pull_wait_ms = max(0, int(wait_ms or 0)) if str(node_id) == blocking_node_id else 0
             try:
@@ -3315,7 +3430,17 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 inflight_by_node[node_id] = max(0, int(inflight_by_node.get(node_id, 0) or 0) - 1)
                 freed_by_node[node_id] = int(freed_by_node.get(node_id, 0) or 0) + 1
                 if int(result.status) == int(pb2.TASK_STATUS_FAILED_INFRA):
+                    is_dependency_result = (
+                        str(getattr(result.error, "type", "") or "").strip().lower() == "dependencyerror"
+                        or is_dependency_runtime_error(str(getattr(result.error, "message", "") or ""))
+                    )
                     infra_failures_by_node[node_id] = int(infra_failures_by_node.get(node_id, 0) or 0) + 1
+                    if is_dependency_result:
+                        self._mark_task_method_node_blacklisted(
+                            node_id,
+                            str(result.error.message or "dependency runtime error"),
+                        )
+                        disabled_submit_nodes.add(node_id)
                     self._mark_pool_submit_failure(
                         node_id,
                         failure_kind=REMOTE_INFRA_FAILED,
@@ -3324,10 +3449,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     if int(infra_failures_by_node.get(node_id, 0) or 0) >= 2:
                         disabled_submit_nodes.add(node_id)
                     if replay_record is not None:
+                        retry_reason = (
+                            dependency_failure_reason(str(result.error.message or ""), method=self._task_method)
+                            if is_dependency_result
+                            else str(result.error.message or "remote infra failure")
+                        )
                         completed_items.extend(
                             self._retry_replay_records(
                                 [replay_record],
-                                reason=str(result.error.message or "remote infra failure"),
+                                reason=retry_reason,
                                 disabled_submit_nodes=disabled_submit_nodes,
                                 scheduler_failures=scheduler_failures,
                                 inflight_by_node=inflight_by_node,
@@ -3411,7 +3541,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         return_items: bool = False,
         receive_batch: int = 1,
         submit_timeout_sec: Optional[float] = None,
@@ -3774,7 +3904,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         return_items: bool = False,
         progress: ProgressOption = False,
         progress_interval_sec: float = 2.0,
@@ -3801,7 +3931,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         return_items: bool = False,
         progress: ProgressOption = False,
         progress_interval_sec: float = 2.0,
@@ -3829,10 +3959,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         receive_batch: int = 1,
-        submit_timeout_sec: float = 60.0,
-        result_timeout_sec: float = 30.0,
+        submit_timeout_sec: float = 600.0,
+        result_timeout_sec: float = 600.0,
         wait_ms: int = 500,
         raise_on_error: bool = True,
         node_window_factor: float = 2.0,
@@ -3875,7 +4005,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         progress: ProgressOption = False,
         progress_interval_sec: float = 2.0,
         **shared_kwargs,
@@ -3914,7 +4044,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         progress: ProgressOption = False,
         progress_interval_sec: float = 2.0,
         **shared_kwargs,
@@ -3948,7 +4078,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str = "",
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         progress: ProgressOption = False,
         progress_interval_sec: float = 2.0,
         **shared_kwargs,
@@ -4170,7 +4300,7 @@ def _build_task_pool_from_infocenter(
     node_instance_ids: Optional[Sequence[str]] = None,
     node_count: int = 0,
     node_limit: int = 100,
-    timeout_sec: float = 10.0,
+    timeout_sec: float = 600.0,
     serialization_mode: str = "",
     policy_id: str = "",
     api_token: str = "",
@@ -4207,6 +4337,34 @@ def _build_task_pool_from_infocenter(
     pinned_instance_selection = bool(requested_node_instance_ids)
     fetch_limit = requested_count if (requested_count > 0 and explicit_node_selection) else node_limit
     create_failures: Dict[str, str] = {}
+    create_failure_node_blacklist: Dict[str, str] = {}
+
+    def _mark_create_failure(node: InfoCenterNode, message: object) -> None:
+        if not is_permanent_replica_create_failure(message, resource_kind="task_pool"):
+            return
+        node_instance_id = _node_instance_key_from_node(node)
+        if node_instance_id:
+            create_failure_node_blacklist[node_instance_id] = format_replica_create_failure(
+                message,
+                resource_kind="task_pool",
+            )
+
+    def _create_failure_block_reason(node: InfoCenterNode) -> str:
+        node_instance_id = _node_instance_key_from_node(node)
+        if not node_instance_id:
+            return ""
+        return str(create_failure_node_blacklist.get(node_instance_id, "") or "")
+
+    def _node_blocks_task_method(node: InfoCenterNode) -> str:
+        method_name = str(entry_callable or "run").strip() or "run"
+        for pool in tuple(getattr(node, "task_pools", ()) or ()):
+            failures = dict(getattr(pool, "method_failures", {}) or {})
+            if method_name in failures:
+                detail = failures.get(method_name)
+                if isinstance(detail, dict):
+                    return str(detail.get("reason") or detail.get("error") or "dependency runtime error").strip()
+                return str(detail or "dependency runtime error")
+        return ""
 
     def _select_candidate_nodes() -> List[InfoCenterNode]:
         def _select_once() -> List[InfoCenterNode]:
@@ -4225,12 +4383,29 @@ def _build_task_pool_from_infocenter(
                     )
                 )
 
-        return _retry_infocenter_request(
+        nodes = _retry_infocenter_request(
             _select_once,
             timeout_sec=max(0.5, float(timeout_sec or 0.0)),
             target=infocenter_target,
             action="task pool node discovery",
         )
+        if explicit_node_selection:
+            blocked = {
+                _node_instance_key_from_node(node): _node_blocks_task_method(node)
+                for node in nodes
+                if _node_blocks_task_method(node)
+            }
+            if blocked:
+                raise RuntimeError(
+                    f"requested task pool node is dependency-blacklisted for method={entry_callable}: {blocked}"
+                )
+            return nodes
+        return [
+            node
+            for node in nodes
+            if not _node_blocks_task_method(node)
+            and not _create_failure_block_reason(node)
+        ]
 
     def _current_healthy_node_keys() -> set[str]:
         try:
@@ -4296,6 +4471,7 @@ def _build_task_pool_from_infocenter(
                 api_token=effective_api_token,
                 expected_node_instance_id=_node_instance_key_from_node(node),
                 create_request_id=create_request_id,
+                timeout_sec=create_rpc_timeout_sec,
             )
         except Exception:
             with contextlib.suppress(Exception):
@@ -4316,6 +4492,7 @@ def _build_task_pool_from_infocenter(
             node_key = _node_instance_key_from_node(item.node)
             if item.error_message:
                 create_failures[node_key] = item.error_message
+                _mark_create_failure(item.node, item.error_message)
                 if _is_node_identity_mismatch_error(item.error_message):
                     _mark_infocenter_node_lost_on_identity_mismatch(
                         infocenter_factory=_infocenter_client,
@@ -4327,12 +4504,13 @@ def _build_task_pool_from_infocenter(
                     )
                 logger.warning(
                     "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s "
-                    "control_addr=%s category=%s err=%s",
+                    "control_addr=%s category=%s missing_module=%s err=%s",
                     effective_pool_name,
                     getattr(item.node, "node_id", ""),
                     node_key,
                     getattr(item.node, "control_addr", ""),
                     classify_error(item.error_message, resource_kind="task_pool").value,
+                    dependency_missing_module(item.error_message),
                     item.error_message,
                 )
                 continue
@@ -4386,6 +4564,7 @@ def _build_task_pool_from_infocenter(
                 node
                 for node in retry_nodes
                 if _node_instance_key_from_node(node) not in tried_node_keys
+                and not _create_failure_block_reason(node)
             ]
             if fresh_retry_nodes:
                 retry_nodes = fresh_retry_nodes
@@ -4471,6 +4650,8 @@ def _build_task_pool_from_infocenter(
         effective_policy=effective_policy,
     )
     session.failures.update(create_failures)
+    session._owner_node_blacklist.update(create_failure_node_blacklist)  # noqa: SLF001
+    session._create_failure_node_blacklist = session._owner_node_blacklist  # noqa: SLF001
     session._configure_dynamic_compensation(
         {
             "infocenter_target": infocenter_target,
@@ -4796,7 +4977,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         serialization_mode: str = "",
         policy_id: str = "",
         api_token: str = "",
@@ -4887,7 +5068,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         serialization_mode: str = "",
         policy_id: str = "",
         api_token: str = "",

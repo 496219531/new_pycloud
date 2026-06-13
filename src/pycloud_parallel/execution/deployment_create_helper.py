@@ -17,6 +17,7 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error
+from pycloud_parallel.execution.dependency_failover import dependency_missing_module
 from pycloud_parallel.execution.support import _prepare_code_blob
 
 TNode = TypeVar("TNode")
@@ -58,6 +59,25 @@ def classify_replica_create_failures(
         for node_id, message in dict(failures or {}).items()
         if str(node_id)
     }
+
+
+def is_permanent_replica_create_failure(message: object, *, resource_kind: str) -> bool:
+    return classify_error(message, resource_kind=resource_kind) in {
+        ErrorCategory.IMPORT_ERROR,
+        ErrorCategory.PERMANENT_ARTIFACT,
+    }
+
+
+def format_replica_create_failure(message: object, *, resource_kind: str) -> str:
+    text = str(message or "").strip()
+    category = classify_error(text, resource_kind=resource_kind).value
+    missing_module = dependency_missing_module(text)
+    parts = [f"category={category}"]
+    if missing_module:
+        parts.append(f"missing_module={missing_module}")
+    if text:
+        parts.append(f"error={text}")
+    return " ".join(parts)
 
 
 def should_retry_replica_create_failures(
@@ -215,6 +235,8 @@ __all__ = [
     "CreateDispatchResult",
     "classify_replica_create_failures",
     "dispatch_create_requests",
+    "format_replica_create_failure",
+    "is_permanent_replica_create_failure",
     "normalize_initial_globals",
     "next_replica_create_interval",
     "prepare_deployment_artifact",

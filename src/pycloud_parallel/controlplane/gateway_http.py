@@ -254,7 +254,7 @@ class GatewayHttpApp:
 
         while True:
             try:
-                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried, method=method)
             except Exception as exc:
                 _record_observation()
                 message = str(last_error or exc)
@@ -292,7 +292,11 @@ class GatewayHttpApp:
                 last_failed_route_id = route_id
                 self.route_cache.mark_failure(route, str(exc))
                 with contextlib.suppress(Exception):
-                    self.route_cache.refresh(service_name, force=True)
+                    refresher = getattr(self.route_cache, "refresh_for_method", None)
+                    if callable(refresher):
+                        refresher(service_name, method=method)
+                    else:
+                        self.route_cache.refresh(service_name, force=True)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -389,7 +393,7 @@ class GatewayHttpApp:
 
         while True:
             try:
-                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried, method=method)
             except Exception as exc:
                 _record_observation()
                 message = str(last_error or exc)
@@ -424,7 +428,11 @@ class GatewayHttpApp:
                 last_failed_route_id = route_id
                 self.route_cache.mark_failure(route, str(exc))
                 with contextlib.suppress(Exception):
-                    self.route_cache.refresh(service_name, force=True)
+                    refresher = getattr(self.route_cache, "refresh_for_method", None)
+                    if callable(refresher):
+                        refresher(service_name, method=method)
+                    else:
+                        self.route_cache.refresh(service_name, force=True)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -461,7 +469,7 @@ class GatewayHttpApp:
 
         while True:
             try:
-                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried, method=method)
             except Exception as exc:
                 _record_observation()
                 message = str(last_error or exc)
@@ -493,7 +501,11 @@ class GatewayHttpApp:
                 last_failed_route_id = route_id
                 self.route_cache.mark_failure(route, str(exc))
                 with contextlib.suppress(Exception):
-                    self.route_cache.refresh(service_name, force=True)
+                    refresher = getattr(self.route_cache, "refresh_for_method", None)
+                    if callable(refresher):
+                        refresher(service_name, method=method)
+                    else:
+                        self.route_cache.refresh(service_name, force=True)
                 continue
             except Exception as exc:
                 last_error = exc

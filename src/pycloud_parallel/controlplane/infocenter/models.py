@@ -47,6 +47,7 @@ class NodeServiceState:
     failure_at: Optional[datetime] = None
     readiness: str = ""
     readiness_reason: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     create_stage: str = ""
     operation_id: str = ""
     operation_updated_at: Optional[datetime] = None
@@ -76,6 +77,7 @@ class NodeTaskPoolInfo:
     stop_reason: str = ""
     failure_reason: str = ""
     failure_at: Optional[datetime] = None
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     readiness: str = ""
     readiness_reason: str = ""
     create_stage: str = ""

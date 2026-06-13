@@ -6773,7 +6773,7 @@ def test_service_worker_liveness_zero_is_telemetry_only(tmp_path, monkeypatch):
         state.close()
 
 
-def test_service_worker_liveness_missing_running_service_keeps_last_alive_count(tmp_path, monkeypatch):
+def test_service_worker_liveness_missing_running_service_marks_zero_as_owner_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(nodecontrol_state_mod, "RESOURCE_LIVENESS_ENABLED", True)
     state = NodeControlState(
         node_id="node-service-liveness-missing",
@@ -6851,7 +6851,7 @@ def test_service_worker_liveness_missing_running_service_keeps_last_alive_count(
         state._handle_service_timeouts()  # noqa: SLF001
 
         assert missing.status == pb2.SERVICE_STATUS_RUNNING
-        assert missing.alive_workers == 1
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert missing.last_liveness_missing_report_at > 0
         assert present.status == pb2.SERVICE_STATUS_RUNNING
@@ -6863,7 +6863,7 @@ def test_service_worker_liveness_missing_running_service_keeps_last_alive_count(
 
         assert missing.status == pb2.SERVICE_STATUS_RUNNING
         assert missing.stop_reason == ""
-        assert missing.alive_workers == 1
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert present.status == pb2.SERVICE_STATUS_RUNNING
         assert present.alive_workers == 1
@@ -7761,7 +7761,7 @@ def test_task_pool_worker_liveness_zero_is_telemetry_only(tmp_path, monkeypatch)
         state.close()
 
 
-def test_task_pool_worker_liveness_missing_running_pool_keeps_last_alive_count(tmp_path, monkeypatch):
+def test_task_pool_worker_liveness_missing_running_pool_marks_zero_as_owner_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(nodecontrol_state_mod, "RESOURCE_LIVENESS_ENABLED", True)
     state = NodeControlState(
         node_id="node-task-pool-liveness-missing",
@@ -7834,7 +7834,7 @@ def test_task_pool_worker_liveness_missing_running_pool_keeps_last_alive_count(t
         state._handle_service_timeouts()  # noqa: SLF001
 
         assert missing.status == "RUNNING"
-        assert missing.alive_workers == 1
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert missing.last_liveness_missing_report_at > 0
         assert present.alive_workers == 1
@@ -7845,7 +7845,7 @@ def test_task_pool_worker_liveness_missing_running_pool_keeps_last_alive_count(t
 
         assert missing.status == "RUNNING"
         assert missing.stop_reason == ""
-        assert missing.alive_workers == 1
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert present.alive_workers == 1
         assert present.degraded is False
@@ -8083,23 +8083,27 @@ def test_nodecontrol_service_dependency_failure_reports_resource_failed(tmp_path
             timeout_sec=1.0,
         )
         report = state.service_report_payloads(include_stopped=True)[0]
+        service_status = service.status
+        service_readiness = service.readiness
+        service_alive_workers = service.resource_snapshot().alive_workers
+        service_stop_reason = service.stop_reason
+        stop_calls_before_close = list(stop_calls)
     finally:
         state.close()
 
     assert code == 503
     assert body["error_type"] == "DependencyError"
     assert "missing_node_dep" in body["error"]
-    assert service.status == pb2.SERVICE_STATUS_STOPPED
-    assert service.readiness == "failed"
-    assert service.resource_snapshot().alive_workers == 0
-    assert "dependency runtime error" in service.stop_reason
-    assert report["resource_health"] == "failed"
-    assert report["readiness"] == "failed"
-    assert "missing_node_dep" in report["readiness_reason"]
+    assert service_status == pb2.SERVICE_STATUS_RUNNING
+    assert service_readiness == "ready"
+    assert service_alive_workers == 1
+    assert service_stop_reason == ""
+    assert report["method_failures"]["run"]["missing_module"] == "missing_node_dep"
+    assert report["resource_health"] == "degraded"
+    assert report["readiness"] == "ready"
+    assert report["readiness_reason"] == "method dependency failure: run"
     assert sync_calls
-    assert _wait_until(lambda: bool(stop_calls))
-    assert stop_calls[0]["service_id"] == service.service_id
-    assert "dependency runtime error" in stop_calls[0]["reason"]
+    assert stop_calls_before_close == []
 
 
 def test_nodecontrol_service_stream_reports_stop_reason_from_inflight_stop(tmp_path):

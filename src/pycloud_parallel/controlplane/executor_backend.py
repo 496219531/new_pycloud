@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Protocol, Tuple
 
-from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
+from pycloud_parallel.controlplane.executor_host import DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC, ExecutorHostClient
 
 EXECUTOR_BACKEND_SUBPROCESS_HOST = "subprocess_host"
 VALID_EXECUTOR_BACKENDS = {EXECUTOR_BACKEND_SUBPROCESS_HOST}
@@ -48,7 +48,7 @@ class ExecutorBackend(Protocol):
         self,
         *,
         artifact_spec: Dict[str, Any],
-        timeout_sec: float = 30.0,
+        timeout_sec: float = DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         scope: str = "",
         key: str = "",
     ) -> Dict[str, Any]: ...
@@ -233,7 +233,7 @@ class SubprocessExecutorBackend:
         self,
         *,
         artifact_spec: Dict[str, Any],
-        timeout_sec: float = 30.0,
+        timeout_sec: float = DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         scope: str = "",
         key: str = "",
     ) -> Dict[str, Any]:

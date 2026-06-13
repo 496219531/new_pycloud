@@ -37,6 +37,8 @@ HEARTBEAT_DEFAULT_MAX_WORKERS = 256
 HEARTBEAT_DEFAULT_RPC_TIMEOUT_SEC = 2.0
 HEARTBEAT_MIN_RPC_TIMEOUT_SEC = 0.05
 HEARTBEAT_MIN_QUEUE_TIMEOUT_SEC = 0.2
+OWNER_ZERO_ALIVE_DISCONNECT_SEC = 100.0
+OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC = 3600.0
 
 
 def _coerce_positive_float(value: Any, default: float = 0.0) -> float:
@@ -114,6 +116,9 @@ class ExecutionSessionBase:
         self._terminal_replica_ids = set()
         self._retry_probe_replica_ids = set()
         self._retry_probe_entered_at: Dict[str, float] = {}
+        self._zero_alive_started_at: Dict[str, float] = {}
+        self._zero_alive_last_failure_at: Dict[str, float] = {}
+        self._disconnect_last_failure_at: Dict[str, float] = {}
         if hasattr(self, "_active_nodes"):
             self._active_nodes = self._active_replica_ids
         if not hasattr(self, "failed"):
@@ -394,6 +399,18 @@ class ExecutionSessionBase:
                 self._replica_log_context(str(node_id or ""), replica),
             )
             return
+        if self._handle_zero_alive_heartbeat_success(node_id, replica):
+            return
+        normalized_node_id = str(node_id or "").strip()
+        was_terminal = self._is_terminal_replica(normalized_node_id)
+        self._handle_replica_reported_method_failures(node_id, replica)
+        blacklist = getattr(self, "_owner_node_blacklist", None)
+        if blacklist is None:
+            blacklist = getattr(self, "_create_failure_node_blacklist", {}) or {}
+        if normalized_node_id in blacklist:
+            return
+        if self._is_terminal_replica(normalized_node_id) and not (allow_new and was_terminal):
+            return
         self._keepalive_failure_counts.pop(node_id, None)
         self._discard_terminal_replica(node_id)
         self._discard_retry_probe_replica(node_id)
@@ -403,6 +420,119 @@ class ExecutionSessionBase:
             replica.last_error = ""
         self.failures.pop(node_id, None)
         self._add_active_replica(node_id)
+
+    def _handle_replica_reported_method_failures(self, node_id: str, replica: ExecutionReplicaHandle) -> None:
+        hook = getattr(self, "_on_replica_method_failures_reported", None)
+        if callable(hook):
+            with contextlib.suppress(Exception):
+                hook(str(node_id or "").strip(), replica, dict(getattr(replica, "method_failures", {}) or {}))
+
+    def _replica_deployed_ready_for_zero_alive(self, replica: ExecutionReplicaHandle) -> bool:
+        readiness = str(getattr(replica, "readiness", "") or "").strip().lower()
+        if readiness and readiness != "ready":
+            return False
+        status = getattr(replica, "status", None)
+        kind = str(getattr(replica, "kind", "") or "").strip()
+        if status is not None:
+            if kind == "service":
+                return int(status or 0) == int(pb2.SERVICE_STATUS_RUNNING)
+            if kind == "task_pool":
+                return str(status or "").strip().upper() == "RUNNING"
+        return _coerce_positive_int(getattr(replica, "worker_count", 0), default=0) > 0
+
+    def _mark_zero_alive_node_blacklisted(self, node_id: str, reason: str) -> None:
+        hook = getattr(self, "_mark_replica_node_instance_blacklisted", None)
+        if callable(hook):
+            with contextlib.suppress(Exception):
+                hook(str(node_id or "").strip(), str(reason or "").strip())
+
+    def _mark_disconnect_node_blacklisted(self, node_id: str, reason: str) -> None:
+        hook = getattr(self, "_mark_replica_node_instance_blacklisted", None)
+        if callable(hook):
+            with contextlib.suppress(Exception):
+                hook(str(node_id or "").strip(), str(reason or "").strip())
+
+    def _record_replica_disconnect_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> bool:
+        normalized = str(node_id or "").strip()
+        if not normalized or not self._is_current_replica(normalized, replica):
+            return False
+        now = time.monotonic()
+        last_failure = float(getattr(self, "_disconnect_last_failure_at", {}).get(normalized, 0.0) or 0.0)
+        getattr(self, "_disconnect_last_failure_at", {})[normalized] = now
+        if last_failure <= 0.0 or now - last_failure > OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC:
+            return False
+        reason = (
+            "repeat owner-node disconnect within "
+            f"{OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC:.0f}s: {repr(exc)}"
+        )
+        self._mark_disconnect_node_blacklisted(normalized, reason)
+        self.failures[normalized] = reason
+        if hasattr(replica, "failed"):
+            replica.failed = True
+        if hasattr(replica, "last_error"):
+            replica.last_error = reason
+        self._discard_active_replica(normalized)
+        self._discard_retry_probe_replica(normalized)
+        self._mark_terminal_replica(normalized)
+        logger.warning(
+            "%s keepalive replica disconnected repeatedly context=%s reason=%s",
+            self.kind or "execution",
+            self._replica_log_context(normalized, replica),
+            reason,
+        )
+        self._wake_keepalive()
+        return True
+
+    def _handle_zero_alive_heartbeat_success(self, node_id: str, replica: ExecutionReplicaHandle) -> bool:
+        normalized = str(node_id or "").strip()
+        if not normalized:
+            return False
+        alive_workers = max(0, int(getattr(replica, "alive_workers", 0) or 0))
+        if alive_workers > 0:
+            getattr(self, "_zero_alive_started_at", {}).pop(normalized, None)
+            return False
+        if not self._replica_deployed_ready_for_zero_alive(replica):
+            getattr(self, "_zero_alive_started_at", {}).pop(normalized, None)
+            return False
+        now = time.monotonic()
+        started = float(getattr(self, "_zero_alive_started_at", {}).get(normalized, 0.0) or 0.0)
+        if started <= 0.0:
+            getattr(self, "_zero_alive_started_at", {})[normalized] = now
+            return False
+        elapsed = max(0.0, now - started)
+        if elapsed < OWNER_ZERO_ALIVE_DISCONNECT_SEC:
+            return False
+        last_failure = float(getattr(self, "_zero_alive_last_failure_at", {}).get(normalized, 0.0) or 0.0)
+        reason = f"alive_workers=0 for {elapsed:.3f}s; treating replica as disconnected"
+        getattr(self, "_zero_alive_last_failure_at", {})[normalized] = now
+        blacklisted = False
+        if last_failure > 0.0 and now - last_failure <= OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC:
+            blacklisted = True
+            blacklist_reason = (
+                f"repeat zero-alive disconnect within {OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC:.0f}s"
+            )
+            self._mark_zero_alive_node_blacklisted(normalized, blacklist_reason)
+            reason = f"{reason}; node_instance blacklisted: {blacklist_reason}"
+        self.failures[normalized] = reason
+        if hasattr(replica, "failed"):
+            replica.failed = True
+        if hasattr(replica, "last_error"):
+            replica.last_error = reason
+        self._keepalive_failure_counts[normalized] = self._heartbeat_failure_threshold(normalized, replica)
+        self._discard_active_replica(normalized)
+        self._discard_retry_probe_replica(normalized)
+        self._mark_terminal_replica(normalized)
+        getattr(self, "_zero_alive_started_at", {}).pop(normalized, None)
+        logger.warning(
+            "%s keepalive replica zero-alive disconnected context=%s elapsed_sec=%.3f blacklisted=%s reason=%s",
+            self.kind or "execution",
+            self._replica_log_context(normalized, replica),
+            elapsed,
+            blacklisted,
+            reason,
+        )
+        self._wake_keepalive()
+        return True
 
     def _mark_replica_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         if not self._is_current_replica(node_id, replica):
@@ -417,6 +547,7 @@ class ExecutionSessionBase:
             replica.status = pb2.SERVICE_STATUS_STOPPED
         elif getattr(replica, "kind", "") == "task_pool" and hasattr(replica, "status"):
             replica.status = "STOPPED"
+        getattr(self, "_zero_alive_started_at", {}).pop(str(node_id or "").strip(), None)
         self._discard_active_replica(node_id)
 
     def _mark_replica_heartbeat_probe_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
@@ -428,6 +559,7 @@ class ExecutionSessionBase:
             replica.failed = True
         if hasattr(replica, "last_error"):
             replica.last_error = message
+        getattr(self, "_zero_alive_started_at", {}).pop(str(node_id or "").strip(), None)
         self._discard_active_replica(node_id)
         self._mark_retry_probe_replica(node_id)
 
@@ -753,6 +885,8 @@ class ExecutionSessionBase:
         error_kind = self._classify_heartbeat_error(node_id, replica, exc)
         if count >= self._heartbeat_failure_threshold(node_id, replica):
             if error_kind == HeartbeatErrorKind.TRANSIENT:
+                if self._record_replica_disconnect_failure(node_id, replica, exc):
+                    return
                 self._mark_replica_heartbeat_probe_failure(node_id, replica, exc)
             else:
                 self._mark_replica_heartbeat_failure(node_id, replica, exc)
@@ -827,6 +961,7 @@ class ExecutionSessionBase:
         stale_pending: list[_HeartbeatPending] = []
         max_workers = self._heartbeat_max_workers()
         executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{self.kind or 'execution'}-hb")
+        exit_reason = "stop requested"
         try:
             while not self._hb_stop.is_set():
                 tick_started_at = time.monotonic()
@@ -924,9 +1059,31 @@ class ExecutionSessionBase:
                     self._hb_wakeup.wait(wait_sec)
                     self._hb_wakeup.clear()
                     if self._hb_stop.is_set():
+                        exit_reason = "stop requested"
                         break
                 elif self._hb_stop.is_set():
+                    exit_reason = "stop requested"
                     break
+                for node_id, pending_state in list(pending.items()):
+                    future = pending_state.future
+                    if future is None:
+                        pending.pop(node_id, None)
+                        continue
+                    replica = pending_state.replica
+                    if self.replicas.get(node_id) is not replica:
+                        future.cancel()
+                        pending.pop(node_id, None)
+                        continue
+                    if not future.done():
+                        continue
+                    pending.pop(node_id, None)
+                    try:
+                        future.result()
+                        completed_count += 1
+                        self._mark_replica_heartbeat_success(node_id, replica)
+                    except Exception as exc:
+                        failed_count += 1
+                        self._handle_heartbeat_exception(node_id, replica, exc)
                 next_tick = time.monotonic() + max(0.1, float(interval_sec))
                 self._keepalive_seq += 1
                 replicas = self.replicas
@@ -936,37 +1093,15 @@ class ExecutionSessionBase:
                 else:
                     heartbeat_ids = list(dict.fromkeys([*heartbeat_ids, *list(self._retry_probe_replica_snapshot())]))
                 heartbeat_ids = [node_id for node_id in heartbeat_ids if not self._is_terminal_replica(node_id)]
-                active_future_count = sum(
-                    1
-                    for state in list(pending.values()) + list(stale_pending)
-                    if state.future is not None and not state.future.done()
+                submitted_count += self._submit_heartbeat_batch(
+                    executor=executor,
+                    pending=pending,
+                    stale_pending=stale_pending,
+                    replicas=replicas,
+                    heartbeat_ids=heartbeat_ids,
+                    max_workers=max_workers,
+                    seq=self._keepalive_seq,
                 )
-                available_submit_slots = max(0, max_workers - active_future_count)
-                for node_id in heartbeat_ids:
-                    if available_submit_slots <= 0:
-                        break
-                    if node_id in pending:
-                        continue
-                    replica = replicas.get(node_id)
-                    if replica is None:
-                        self._discard_active_replica(node_id)
-                        continue
-                    pending_state = _HeartbeatPending(
-                        replica=replica,
-                        submitted_at=time.monotonic(),
-                        last_pending_report_at=time.monotonic(),
-                    )
-                    future = executor.submit(
-                        self._timed_heartbeat_replica,
-                        node_id,
-                        replica,
-                        seq=self._keepalive_seq,
-                        pending_state=pending_state,
-                    )
-                    pending_state.future = future
-                    pending[node_id] = pending_state
-                    submitted_count += 1
-                    available_submit_slots -= 1
                 if not self._active_replica_snapshot():
                     can_compensate = bool(getattr(self, "_compensation_spec", None))
                     retryable_replica_ids = [
@@ -983,6 +1118,7 @@ class ExecutionSessionBase:
                     ]
                     can_retry = bool(retryable_replica_ids)
                     if not (can_retry or can_compensate):
+                        exit_reason = "no active replicas and no retry or compensation available"
                         self.failed = True
                         self._hb_stop.set()
                         break
@@ -1012,7 +1148,76 @@ class ExecutionSessionBase:
                 if pending_state.future is not None:
                     pending_state.future.cancel()
         finally:
+            try:
+                active = sorted(self._active_replica_snapshot())
+                retry_probe = sorted(self._retry_probe_replica_snapshot())
+                terminal = sorted(getattr(self, "_terminal_replica_ids", set()) or [])
+                replicas = sorted(str(node_id) for node_id in self.replicas.keys() if str(node_id))
+                failures = dict(getattr(self, "failures", {}) or {})
+                has_compensation = bool(getattr(self, "_compensation_spec", None))
+                logger.warning(
+                    "%s keepalive loop exited reason=%s replicas=%s active=%s retry_probe=%s "
+                    "terminal=%s failures=%s has_compensation=%s pending=%d stale_pending=%d",
+                    self.kind or "execution",
+                    exit_reason,
+                    replicas,
+                    active,
+                    retry_probe,
+                    terminal,
+                    failures,
+                    has_compensation,
+                    len(pending),
+                    len(stale_pending),
+                )
+            except Exception:
+                logger.exception("%s keepalive loop exit diagnostics failed", self.kind or "execution")
             executor.shutdown(wait=False, cancel_futures=True)
+
+    def _submit_heartbeat_batch(
+        self,
+        *,
+        executor: ThreadPoolExecutor,
+        pending: Dict[str, _HeartbeatPending],
+        stale_pending: list[_HeartbeatPending],
+        replicas: Dict[str, ExecutionReplicaHandle],
+        heartbeat_ids: list[str],
+        max_workers: int,
+        seq: int,
+    ) -> int:
+        active_future_count = sum(
+            1
+            for state in list(pending.values()) + list(stale_pending)
+            if state.future is not None and not state.future.done()
+        )
+        available_submit_slots = max(0, max_workers - active_future_count)
+        submitted_count = 0
+        for node_id in heartbeat_ids:
+            if available_submit_slots <= 0:
+                break
+            if node_id in pending:
+                continue
+            replica = replicas.get(node_id)
+            if replica is None:
+                self._discard_active_replica(node_id)
+                continue
+            submitted_at = time.monotonic()
+            pending_state = _HeartbeatPending(
+                replica=replica,
+                submitted_at=submitted_at,
+                last_pending_report_at=submitted_at,
+            )
+            future = executor.submit(
+                self._timed_heartbeat_replica,
+                node_id,
+                replica,
+                seq=seq,
+                pending_state=pending_state,
+            )
+            pending_state.future = future
+            pending[node_id] = pending_state
+            submitted_count += 1
+            available_submit_slots -= 1
+        return submitted_count
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:
@@ -1026,6 +1231,7 @@ class ExecutionSessionBase:
                 self._terminal_replica_ids = set()
                 self._retry_probe_replica_ids = set()
                 self._retry_probe_entered_at = {}
+                self._zero_alive_started_at = {}
             if hasattr(self, "_active_nodes"):
                 self._active_nodes = self._active_replica_ids
             for replica in self.replicas.values():

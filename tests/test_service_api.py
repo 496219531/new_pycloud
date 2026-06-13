@@ -425,13 +425,16 @@ def test_service_compensation_attaches_each_replica_before_next_create_finishes(
     assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
 
 
-def test_service_zero_alive_does_not_drive_owner_compensation() -> None:
+def test_service_zero_alive_disconnects_owner_replica_and_compensates(monkeypatch) -> None:
     replica = SimpleNamespace(
+        kind="service",
         service_id="svc-zero",
         service_name="svc-zero",
         worker_count=1,
         alive_workers=0,
         heartbeat_timeout_sec=30,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        readiness="ready",
     )
     group = Service(owner_client_id="owner-1", service_name="svc-zero", sessions={"node-1": replica}, nodes={})
     group._configure_dynamic_compensation(  # noqa: SLF001
@@ -443,12 +446,88 @@ def test_service_zero_alive_does_not_drive_owner_compensation() -> None:
     submitted = []
     group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
 
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
     try:
         group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
         assert group._active_replica_snapshot() == {"node-1"}  # noqa: SLF001
-        for _idx in range(3):
-            group._after_keepalive_tick()  # noqa: SLF001
-        assert submitted == []
+        now[0] += 101.0
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+        assert group._active_replica_snapshot() == set()  # noqa: SLF001
+        assert "node-1" in group._terminal_replica_ids  # noqa: SLF001
+        assert "alive_workers=0" in group.failures["node-1"]
+        group._after_keepalive_tick()  # noqa: SLF001
+        assert submitted
+    finally:
+        group._stop_keepalive()  # noqa: SLF001
+
+
+def test_service_repeated_zero_alive_disconnect_blacklists_node_instance(monkeypatch) -> None:
+    replica = SimpleNamespace(
+        kind="service",
+        service_id="svc-zero",
+        service_name="svc-zero",
+        worker_count=1,
+        alive_workers=0,
+        heartbeat_timeout_sec=30,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        readiness="ready",
+    )
+    group = Service(owner_client_id="owner-1", service_name="svc-zero", sessions={"node-1": replica}, nodes={})
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    try:
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+        now[0] += 101.0
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+        assert "node-1" not in group._create_failure_node_blacklist  # noqa: SLF001
+
+        group._discard_terminal_replica("node-1")  # noqa: SLF001
+        group._add_active_replica("node-1")  # noqa: SLF001
+        group._zero_alive_started_at.pop("node-1", None)  # noqa: SLF001
+        now[0] += 10.0
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+        now[0] += 101.0
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+
+        assert "node-1" in group._create_failure_node_blacklist  # noqa: SLF001
+        assert "repeat zero-alive disconnect" in group._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+    finally:
+        group._stop_keepalive()  # noqa: SLF001
+
+
+def test_service_repeated_owner_node_disconnect_blacklists_node_instance(monkeypatch) -> None:
+    replica = SimpleNamespace(
+        kind="service",
+        service_id="svc-disconnect",
+        service_name="svc-disconnect",
+        worker_count=1,
+        alive_workers=1,
+        heartbeat_timeout_sec=30,
+        heartbeat_failure_threshold=1,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        readiness="ready",
+    )
+    group = Service(owner_client_id="owner-1", service_name="svc-disconnect", sessions={"node-1": replica}, nodes={})
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    try:
+        group._record_heartbeat_failure("node-1", replica, TimeoutError("cannot connect"))  # noqa: SLF001
+        assert "node-1" not in group._create_failure_node_blacklist  # noqa: SLF001
+        assert "node-1" in group._retry_probe_replica_snapshot()  # noqa: SLF001
+
+        group._discard_retry_probe_replica("node-1")  # noqa: SLF001
+        group._discard_terminal_replica("node-1")  # noqa: SLF001
+        group._add_active_replica("node-1")  # noqa: SLF001
+        now[0] += 1800.0
+        group._record_heartbeat_failure("node-1", replica, TimeoutError("cannot connect again"))  # noqa: SLF001
+
+        assert "node-1" in group._create_failure_node_blacklist  # noqa: SLF001
+        assert "repeat owner-node disconnect" in group._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+        assert "node-1" not in group._active_replica_snapshot()  # noqa: SLF001
+        assert "node-1" in group._terminal_replica_ids  # noqa: SLF001
     finally:
         group._stop_keepalive()  # noqa: SLF001
 
@@ -699,6 +778,345 @@ def test_service_call_balanced_all_initializing_has_clear_error():
         group.call_balanced("run", {}, refresh_status=True)
 
 
+def test_service_call_balanced_blacklists_dependency_failure_per_method():
+    class _Replica:
+        kind = "service"
+        heartbeat_timeout_sec = 30
+        service_token = "token"
+        status = pb2.SERVICE_STATUS_RUNNING
+        worker_count = 1
+        readiness = "ready"
+
+        def __init__(self, node_id: str, *, dependency_error_method: str = "") -> None:
+            self.node_id = node_id
+            self.service_id = f"svc-{node_id}"
+            self.dependency_error_method = dependency_error_method
+            self.calls: list[str] = []
+
+        def get_status(self):
+            return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+        def call(self, method, payload, **_kwargs):
+            self.calls.append(method)
+            if self.dependency_error_method == method:
+                raise RuntimeError("FAILED_DEPENDENCY DependencyError: No module named 'missing_pkg'")
+            return {"node": self.node_id, "method": method, "payload": payload}
+
+        def lease(self):
+            return None
+
+        def snapshot(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def identity(self):
+            return SimpleNamespace()
+
+        def binding(self):
+            return SimpleNamespace()
+
+    bad = _Replica("node-bad", dependency_error_method="bad_func")
+    good = _Replica("node-good")
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-bad": bad, "node-good": good},
+        nodes={},
+    )
+
+    node_id, response = group.call_balanced(
+        "bad_func",
+        {"value": 1},
+        strategy="round_robin",
+        refresh_status=False,
+        max_attempts=2,
+    )
+    node_id_2, response_2 = group.call_balanced(
+        "bad_func",
+        {"value": 2},
+        strategy="round_robin",
+        refresh_status=False,
+        max_attempts=2,
+    )
+    group._route_index = 0  # noqa: SLF001
+    node_id_3, response_3 = group.call_balanced(
+        "good_func",
+        {"value": 3},
+        strategy="round_robin",
+        refresh_status=False,
+        max_attempts=2,
+    )
+
+    assert node_id == "node-good"
+    assert response["node"] == "node-good"
+    assert node_id_2 == "node-good"
+    assert response_2["payload"] == {"value": 2}
+    assert node_id_3 == "node-bad"
+    assert response_3["node"] == "node-bad"
+    assert bad.calls == ["bad_func", "good_func"]
+
+
+def test_service_dependency_failures_escalate_to_owner_node_blacklist_when_ratio_exceeds_threshold():
+    class _Replica:
+        kind = "service"
+        heartbeat_timeout_sec = 30
+        service_token = "token"
+        status = pb2.SERVICE_STATUS_RUNNING
+        worker_count = 1
+        readiness = "ready"
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.service_id = f"svc-{node_id}"
+            self.failed = False
+            self.last_error = ""
+
+        def get_status(self):
+            return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+        def call(self, method, payload, **_kwargs):
+            del payload
+            raise RuntimeError(f"FAILED_DEPENDENCY DependencyError: No module named 'missing_{method}'")
+
+        def lease(self):
+            return None
+
+        def snapshot(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def identity(self):
+            return SimpleNamespace()
+
+        def binding(self):
+            return SimpleNamespace()
+
+    bad = _Replica("node-bad")
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-bad": bad},
+        nodes={},
+    )
+    group._discovered_methods = [f"func_{idx}" for idx in range(5)]  # noqa: SLF001
+
+    with pytest.raises(RuntimeError):
+        group.call_balanced("func_0", {}, strategy="round_robin", refresh_status=False, max_attempts=1)
+    assert "node-bad" in group._active_replica_snapshot()  # noqa: SLF001
+    assert "node-bad" not in group._create_failure_node_blacklist  # noqa: SLF001
+
+    with pytest.raises(RuntimeError):
+        group.call_balanced("func_1", {}, strategy="round_robin", refresh_status=False, max_attempts=1)
+
+    assert "node-bad" not in group._active_replica_snapshot()  # noqa: SLF001
+    assert "node-bad" in group._terminal_replica_ids  # noqa: SLF001
+    assert "node-bad" in group._create_failure_node_blacklist  # noqa: SLF001
+    assert "runtime dependency failure threshold exceeded" in group._create_failure_node_blacklist["node-bad"]  # noqa: SLF001
+
+
+def test_service_dependency_failures_escalate_to_owner_node_blacklist_after_three_methods():
+    class _Replica:
+        kind = "service"
+        heartbeat_timeout_sec = 30
+        service_token = "token"
+        status = pb2.SERVICE_STATUS_RUNNING
+        worker_count = 1
+        readiness = "ready"
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.service_id = f"svc-{node_id}"
+            self.failed = False
+            self.last_error = ""
+
+        def get_status(self):
+            return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+        def call(self, method, payload, **_kwargs):
+            del payload
+            raise RuntimeError(f"FAILED_DEPENDENCY DependencyError: No module named 'missing_{method}'")
+
+        def lease(self):
+            return None
+
+        def snapshot(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def identity(self):
+            return SimpleNamespace()
+
+        def binding(self):
+            return SimpleNamespace()
+
+    bad = _Replica("node-bad")
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-bad": bad},
+        nodes={},
+    )
+    group._discovered_methods = [f"func_{idx}" for idx in range(10)]  # noqa: SLF001
+
+    for method in ("func_0", "func_1"):
+        with pytest.raises(RuntimeError):
+            group.call_balanced(method, {}, strategy="round_robin", refresh_status=False, max_attempts=1)
+        assert "node-bad" in group._active_replica_snapshot()  # noqa: SLF001
+        assert "node-bad" not in group._create_failure_node_blacklist  # noqa: SLF001
+
+    with pytest.raises(RuntimeError):
+        group.call_balanced("func_2", {}, strategy="round_robin", refresh_status=False, max_attempts=1)
+
+    assert "node-bad" not in group._active_replica_snapshot()  # noqa: SLF001
+    assert "node-bad" in group._terminal_replica_ids  # noqa: SLF001
+    assert "node-bad" in group._create_failure_node_blacklist  # noqa: SLF001
+    assert "runtime dependency failure threshold exceeded" in group._create_failure_node_blacklist["node-bad"]  # noqa: SLF001
+
+
+def test_service_heartbeat_reported_method_failures_drive_owner_blacklist():
+    replica = SimpleNamespace(
+        kind="service",
+        service_id="svc-node",
+        service_name="svc-node",
+        worker_count=1,
+        alive_workers=1,
+        heartbeat_timeout_sec=30,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        readiness="ready",
+        method_failures={
+            "func_a": {"reason": "No module named 'missing_a'"},
+            "func_b": {"reason": "No module named 'missing_b'"},
+        },
+    )
+    group = Service(owner_client_id="owner-1", service_name="svc-node", sessions={"node-1": replica}, nodes={})
+    group._discovered_methods = ["func_a", "func_b", "func_c", "func_d", "func_e"]  # noqa: SLF001
+
+    group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+
+    assert "node-1" not in group._active_replica_snapshot()  # noqa: SLF001
+    assert "node-1" in group._create_failure_node_blacklist  # noqa: SLF001
+    assert "runtime dependency failure threshold exceeded" in group._create_failure_node_blacklist["node-1"]  # noqa: SLF001
+
+
+def test_service_call_balanced_retries_if_response_source_becomes_untrusted():
+    class _Replica:
+        kind = "service"
+        heartbeat_timeout_sec = 30
+        service_token = "token"
+        status = pb2.SERVICE_STATUS_RUNNING
+        worker_count = 1
+        readiness = "ready"
+
+        def __init__(self, node_id: str, service_id: str, group=None) -> None:
+            self.node_id = node_id
+            self.service_id = service_id
+            self.group = group
+            self.calls = 0
+
+        def get_status(self):
+            return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+        def call(self, method, payload, **_kwargs):
+            self.calls += 1
+            if self.group is not None:
+                self.group._discard_active_replica(self.node_id)  # noqa: SLF001
+            return {"node": self.node_id, "method": method, "payload": payload}
+
+        def lease(self):
+            return None
+
+        def snapshot(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def identity(self):
+            return SimpleNamespace()
+
+        def binding(self):
+            return SimpleNamespace()
+
+    old = _Replica("node-a-old", "svc-old")
+    new = _Replica("node-b-new", "svc-new")
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-a-old": old, "node-b-new": new},
+        nodes={},
+    )
+    old.group = group
+
+    node_id, response = group.call_balanced(
+        "run",
+        {"value": 1},
+        strategy="round_robin",
+        refresh_status=False,
+        max_attempts=2,
+    )
+
+    assert node_id == "node-b-new"
+    assert response["node"] == "node-b-new"
+    assert old.calls == 1
+    assert new.calls == 1
+
+
+def test_service_acall_balanced_retries_if_response_source_becomes_untrusted():
+    class _Replica:
+        kind = "service"
+        heartbeat_timeout_sec = 30
+        service_token = "token"
+        status = pb2.SERVICE_STATUS_RUNNING
+        worker_count = 1
+        readiness = "ready"
+
+        def __init__(self, node_id: str, service_id: str, group=None) -> None:
+            self.node_id = node_id
+            self.service_id = service_id
+            self.group = group
+            self.calls = 0
+
+        def get_status(self):
+            return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+        def call(self, method, payload, **_kwargs):
+            self.calls += 1
+            if self.group is not None:
+                self.group._discard_active_replica(self.node_id)  # noqa: SLF001
+            return {"node": self.node_id, "method": method, "payload": payload}
+
+        def lease(self):
+            return None
+
+        def snapshot(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def identity(self):
+            return SimpleNamespace()
+
+        def binding(self):
+            return SimpleNamespace()
+
+    old = _Replica("node-a-old", "svc-old")
+    new = _Replica("node-b-new", "svc-new")
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-a-old": old, "node-b-new": new},
+        nodes={},
+    )
+    old.group = group
+
+    node_id, response = asyncio.run(
+        group.acall_balanced(
+            "run",
+            {"value": 1},
+            strategy="round_robin",
+            refresh_status=False,
+            max_attempts=2,
+        )
+    )
+
+    assert node_id == "node-b-new"
+    assert response["node"] == "node-b-new"
+    assert old.calls == 1
+    assert new.calls == 1
+
+
 def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
@@ -808,6 +1226,92 @@ def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatc
     assert added == 1
     assert created[0][0] == "127.0.0.1:50062"
     assert "node-inst-1" in group.failures
+
+
+def test_service_compensation_blacklists_permanent_create_failure_node_id(monkeypatch):
+    node_old = SimpleNamespace(
+        node_id="node-bad",
+        node_instance_id="node-bad-old",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    node_new = SimpleNamespace(
+        node_id="node-bad",
+        node_instance_id="node-bad-new",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    calls = []
+    nodes_by_attempt = [[node_old], [node_new]]
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return nodes_by_attempt[min(len(calls), len(nodes_by_attempt) - 1)]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            calls.append((self.target, dict(kwargs)))
+            raise RuntimeError("ModuleNotFoundError: No module named 'missing_pkg'")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 0
+    assert group.try_compensate_replicas() == 0
+    assert [target for target, _kwargs in calls] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+    assert group._create_failure_node_blacklist["node-bad-old"].startswith("category=import_error")  # noqa: SLF001
+    assert "missing_module=missing_pkg" in group._create_failure_node_blacklist["node-bad-old"]  # noqa: SLF001
+    assert group._create_failure_node_blacklist["node-bad-new"].startswith("category=import_error")  # noqa: SLF001
 
 
 def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
@@ -3052,6 +3556,118 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
         node.close()
 
 
+def test_discovery_service_client_uses_method_specific_routes(monkeypatch):
+    from datetime import datetime, timezone
+
+    from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
+    from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
+
+    bad = InfoCenterServiceRoute(
+        service_name="svc-method-client",
+        service_id="svc-bad",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id="node-bad",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50061",
+        node_healthy=True,
+        worker_count=1,
+        alive_workers=1,
+        in_flight=0,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url="http://127.0.0.1:18081/svc/svc-bad",
+        method_failures={"bad_func": {"reason": "missing dependency"}},
+    )
+    good = InfoCenterServiceRoute(
+        service_name="svc-method-client",
+        service_id="svc-good",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id="node-good",
+        node_id="node-good",
+        control_addr="127.0.0.1:50062",
+        node_healthy=True,
+        worker_count=1,
+        alive_workers=1,
+        in_flight=0,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url="http://127.0.0.1:18082/svc/svc-good",
+    )
+
+    class _FakeRouteCache:
+        def __init__(self, **_kwargs):
+            self.routes = [bad, good]
+            self.selected_methods = []
+            self.refreshed_methods = []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def refresh_for_method(self, service_name, *, method):
+            del service_name
+            self.refreshed_methods.append(method)
+            return [
+                route
+                for route in self.routes
+                if method not in dict(getattr(route, "method_failures", {}) or {})
+            ]
+
+        def select_route(self, service_name, *, exclude_service_ids=None, strategy="predicted_busy", method=""):
+            del service_name, strategy
+            self.selected_methods.append(method)
+            excluded = set(exclude_service_ids or ())
+            for route in self.refresh_for_method("svc-method-client", method=method):
+                if route.service_id not in excluded:
+                    return route
+            raise RuntimeError("no available route")
+
+        def mark_success(self, route):
+            return None
+
+        def mark_failure(self, route, error):
+            return None
+
+        def release_route(self, route):
+            return None
+
+        def record_call_observation(self, service_name, **kwargs):
+            return None
+
+    calls = []
+
+    def _fake_call_route_http(route, **kwargs):
+        calls.append((route.service_id, kwargs["method"]))
+        return {"ok": True, "data": {"route": route.service_id}}
+
+    fake_cache_holder = {}
+
+    def _fake_cache_factory(**kwargs):
+        cache = _FakeRouteCache(**kwargs)
+        fake_cache_holder["cache"] = cache
+        return cache
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.discovery_client.client_mod._DiscoveryRouteCache",
+        _fake_cache_factory,
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
+        _fake_call_route_http,
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.discovery_client.client_mod._prepare_remote_call_payload",
+        lambda _clients, payload, **_kwargs: dict(payload or {}),
+    )
+
+    with DiscoveryServiceClient("127.0.0.1:50051", timeout_sec=1.0) as client:
+        resp = client.call(service_name="svc-method-client", method="bad_func", payload={})
+
+    assert resp["data"]["route"] == "svc-good"
+    assert calls == [("svc-good", "bad_func")]
+    assert fake_cache_holder["cache"].selected_methods == ["bad_func"]
+
+
 def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_registered_service.py"
     module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
@@ -3975,6 +4591,245 @@ class TestOwnerServiceFacade:
         assert "[Service] deploy start" in err
         assert "[Service] deploy success service_name=demo-service routes=" in err
         assert "node-1/node-1@127.0.0.1:50061(service_id=svc-1, http=http://127.0.0.1:18081/svc/svc-1)" in err
+        for client in group._clients.values():  # noqa: SLF001
+            client.close()
+
+    def test_deploy_same_code_without_token_cache_redeploys_fresh(self, tmp_path, capsys):
+        from datetime import datetime, timezone, timedelta
+
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.execution.support import _artifact_code_version
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        source = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        code_version = _artifact_code_version(
+            source,
+            runtime="py3",
+            entry_module="demo_service",
+            entry_callable="run",
+            package_format="py",
+            export_mode="all",
+            export_methods=[],
+        )
+        node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            accept_service_deploy=True,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        route = InfoCenterServiceRoute(
+            service_name="demo-service",
+            service_id="svc-old",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-1-inst",
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            node_healthy=True,
+            worker_count=1,
+            alive_workers=1,
+            in_flight=0,
+            lease_expire_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            owner_client_id="owner-demo",
+            code_version=code_version,
+            policy_id="default_safe",
+        )
+        created = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def get_service_status(self, *, service_id: str):
+                assert service_id == "svc-old"
+                return SimpleNamespace(
+                    service_name="demo-service",
+                    service_id="svc-old",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    owner_client_id="owner-demo",
+                    code_version=code_version,
+                    policy_id="default_safe",
+                    worker_count=1,
+                    alive_workers=1,
+                    in_flight=0,
+                    http_base_url="http://127.0.0.1:18081/svc/svc-old",
+                    created_at=0,
+                    last_heartbeat_at=0,
+                    lease_expire_at=0,
+                )
+
+            def create_service_from_bytes(self, **_kwargs):
+                created.append(True)
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=([route], [node]),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-service",
+                source=source,
+                entry_module="demo_service",
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        assert created == [True]
+        assert list(group.sessions.values())[0].service_id == "svc-new"
+        assert "no reusable local token cache" in capsys.readouterr().err
+        for client in group._clients.values():  # noqa: SLF001
+            client.close()
+
+    def test_deploy_changed_code_without_token_cache_redeploys_fresh(self, tmp_path, capsys):
+        from datetime import datetime, timezone, timedelta
+
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.execution.support import _artifact_code_version
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        old_source = b"def run(**_kwargs):\n    return {'version': 1}\n"
+        new_source = b"def run(**_kwargs):\n    return {'version': 2}\n"
+        old_code_version = _artifact_code_version(
+            old_source,
+            runtime="py3",
+            entry_module="demo_service",
+            entry_callable="run",
+            package_format="py",
+            export_mode="all",
+            export_methods=[],
+        )
+        node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            accept_service_deploy=True,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        route = InfoCenterServiceRoute(
+            service_name="demo-service",
+            service_id="svc-old",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-1-inst",
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            node_healthy=True,
+            worker_count=1,
+            alive_workers=1,
+            in_flight=0,
+            lease_expire_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            owner_client_id="owner-demo",
+            code_version=old_code_version,
+            policy_id="default_safe",
+        )
+        created = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def get_service_status(self, *, service_id: str):
+                assert service_id == "svc-old"
+                return SimpleNamespace(
+                    service_name="demo-service",
+                    service_id="svc-old",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    owner_client_id="owner-demo",
+                    code_version=old_code_version,
+                    policy_id="default_safe",
+                    worker_count=1,
+                    alive_workers=1,
+                    in_flight=0,
+                    http_base_url="http://127.0.0.1:18081/svc/svc-old",
+                    created_at=0,
+                    last_heartbeat_at=0,
+                    lease_expire_at=0,
+                )
+
+            def create_service_from_bytes(self, **kwargs):
+                created.append(kwargs.get("blob"))
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=([route], [node]),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-service",
+                source=new_source,
+                entry_module="demo_service",
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        assert created == [new_source]
+        assert list(group.sessions.values())[0].service_id == "svc-new"
+        assert "changed-code service has no reusable local token cache" in capsys.readouterr().err
         for client in group._clients.values():  # noqa: SLF001
             client.close()
 
@@ -4981,6 +5836,61 @@ class TestOwnerServiceFacade:
         finally:
             group._stop_keepalive()  # noqa: SLF001
 
+    def test_owner_keepalive_resubmits_after_completed_heartbeat_without_skipping_tick(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 30
+            heartbeat_failure_threshold = 1
+            service_id = "svc-resubmit"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self.calls = []
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls.append(time.monotonic())
+                time.sleep(0.01)
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+
+        group._start_keepalive(interval_sec=0.2)  # noqa: SLF001
+        try:
+            deadline = time.monotonic() + 0.75
+            while time.monotonic() < deadline and len(replica.calls) < 3:
+                time.sleep(0.02)
+            assert len(replica.calls) >= 3
+            deltas = [replica.calls[i] - replica.calls[i - 1] for i in range(1, len(replica.calls))]
+            assert min(deltas) < 0.3
+        finally:
+            group._stop_keepalive()  # noqa: SLF001
+
     def test_replica_log_context_does_not_probe_remote_status_by_default(self):
         from pycloud_parallel.execution.service_session import Service
 
@@ -5285,6 +6195,7 @@ class TestOwnerServiceFacade:
         )
 
         group._record_heartbeat_failure("node-1", replica, RuntimeError("temporary server unavailable"))  # noqa: SLF001
+        group._disconnect_last_failure_at["node-1"] = time.monotonic() - 3700.0  # noqa: SLF001
 
         assert "node-1" not in group._active_replica_ids  # noqa: SLF001
         assert group.failed is False

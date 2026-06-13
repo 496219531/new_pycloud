@@ -899,32 +899,29 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
             assert "still running" in str(exc)
 
         try:
-            Service._deploy_from_infocenter(
-                infocenter_target=info_target,
-                owner_client_id="owner-replace-test",
-                service_name="svc-replace-test",
-                source=blob_v2,
-                runtime="py3",
-                entry_module="svc_replace_test",
-                entry_callable="run",
-                worker_count=2,
-                heartbeat_timeout_sec=30,
-                healthy_only=True,
-                tags=["replace"],
-                min_success_nodes=2,
-                allow_partial=False,
-                timeout_sec=10.0,
-                session_cache_dir=str(cache_dir),
-            )
-            assert False, "expected running service with changed code to be rejected"
-        except RuntimeError as exc:
-            assert (
-                "another local deploy process is already active" in str(exc)
-                or "no local token cache was found" in str(exc)
-            )
-
-        try:
             first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
+            try:
+                Service._deploy_from_infocenter(
+                    infocenter_target=info_target,
+                    owner_client_id="owner-replace-test",
+                    service_name="svc-replace-test",
+                    source=blob_v2,
+                    runtime="py3",
+                    entry_module="svc_replace_test",
+                    entry_callable="run",
+                    worker_count=2,
+                    heartbeat_timeout_sec=30,
+                    healthy_only=True,
+                    tags=["replace"],
+                    min_success_nodes=2,
+                    allow_partial=False,
+                    timeout_sec=10.0,
+                    session_cache_dir=str(cache_dir),
+                )
+                assert False, "expected active local owner lock to reject concurrent changed-code deploy"
+            except RuntimeError as exc:
+                assert "another local deploy process is already active" in str(exc)
+
             group1.close(end_services=True, reason="replace old version first")
             _sync_node_services(info_target, node_id="node-replace-01", control_addr=n1_target, tags=["replace"], state=n1_state)
             _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)

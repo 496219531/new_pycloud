@@ -12,7 +12,14 @@ from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 
 
 class RouteSource(Protocol):
-    def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> Sequence[InfoCenterServiceRoute]:
+    def list_service_routes(
+        self,
+        *,
+        service_name: str,
+        healthy_only: bool,
+        limit: int,
+        method: str = "",
+    ) -> Sequence[InfoCenterServiceRoute]:
         """Return routes for a service name."""
 
 
@@ -20,11 +27,19 @@ class RouteSource(Protocol):
 class InProcessInfoCenterSource:
     state: InfoCenterState
 
-    def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> Sequence[InfoCenterServiceRoute]:
+    def list_service_routes(
+        self,
+        *,
+        service_name: str,
+        healthy_only: bool,
+        limit: int,
+        method: str = "",
+    ) -> Sequence[InfoCenterServiceRoute]:
         rows = self.state.list_service_routes(
             service_name=service_name,
             healthy_only=healthy_only,
             limit=limit,
+            method=method,
         )
         out = []
         for item in rows:
@@ -57,6 +72,10 @@ class InProcessInfoCenterSource:
                     ema_samples=int(item.get("ema_samples", 0) or 0),
                     predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
                     policy_id=str(item.get("policy_id", "") or "default_safe"),
+                    method_failures={
+                        str(k): dict(v) if isinstance(v, dict) else {"reason": str(v)}
+                        for k, v in dict(item.get("method_failures") or {}).items()
+                    },
                 )
             )
         return out
@@ -69,7 +88,14 @@ class RemoteInfoCenterSource:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _client: Optional[InfoCenterClient] = field(default=None, init=False, repr=False)
 
-    def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> Sequence[InfoCenterServiceRoute]:
+    def list_service_routes(
+        self,
+        *,
+        service_name: str,
+        healthy_only: bool,
+        limit: int,
+        method: str = "",
+    ) -> Sequence[InfoCenterServiceRoute]:
         with self._lock:
             client = self._client
             if client is None:
@@ -81,6 +107,7 @@ class RemoteInfoCenterSource:
                     service_name=service_name,
                     healthy_only=healthy_only,
                     limit=limit,
+                    method=method,
                 )
             )
         except Exception:

@@ -104,6 +104,8 @@ def _service_status_name(status: int) -> str:
 
 
 def _service_report_status_text(session: ServiceSession) -> str:
+    if bool(getattr(session, "method_failures", None)) and session.is_running():
+        return "DEGRADED"
     if bool(getattr(session, "degraded", False)):
         return "DEGRADED"
     return _service_status_name(session.status)
@@ -117,7 +119,7 @@ def _service_resource_health(session: ServiceSession, *, alive_workers: int) -> 
         return "stopped"
     if str(session.stop_reason or "").strip():
         return "failed"
-    if bool(getattr(session, "degraded", False)):
+    if bool(getattr(session, "degraded", False)) or bool(getattr(session, "method_failures", None)):
         return "degraded"
     return "running"
 
@@ -170,6 +172,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
+        "method_failures": dict(getattr(session, "method_failures", {}) or {}),
         "timing_metrics": dict(session.timing_metrics or {}),
         "degraded": bool(getattr(session, "degraded", False)),
     }
@@ -221,6 +224,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "degraded": bool(getattr(session, "degraded", False)),
         "readiness": str(getattr(session, "readiness", "") or ""),
         "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
+        "method_failures": dict(getattr(session, "method_failures", {}) or {}),
         "create_stage": str(getattr(session, "create_stage", "") or ""),
         "operation_id": str(getattr(session, "operation_id", "") or ""),
         "operation_updated_at": (
@@ -259,6 +263,7 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         stop_reason=stop_reason,
         failure_reason=stop_reason,
         failure_at=getattr(pool, "failure_at", None),
+        method_failures=dict(getattr(pool, "method_failures", {}) or {}),
         readiness=str(getattr(pool, "readiness", "") or ""),
         readiness_reason=str(getattr(pool, "readiness_reason", "") or ""),
         create_stage=str(getattr(pool, "create_stage", "") or ""),
@@ -294,6 +299,7 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "stop_reason": str(pool.stop_reason or ""),
         "failure_reason": str(pool.stop_reason or ""),
         "failure_at": getattr(pool, "failure_at", None),
+        "method_failures": dict(getattr(pool, "method_failures", {}) or {}),
         "readiness": str(getattr(pool, "readiness", "") or ""),
         "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
         "create_stage": str(getattr(pool, "create_stage", "") or ""),

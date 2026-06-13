@@ -77,6 +77,7 @@ class NativeTaskPoolClient:
     readiness: str = "ready"
     readiness_reason: str = ""
     create_stage: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     operation_id: str = ""
     operation_updated_at: str = ""
     signal_cursor: int = 0
@@ -204,6 +205,14 @@ class NativeTaskPoolClient:
         with contextlib.suppress(Exception):
             if isinstance(heartbeat_resource, dict) and "alive_workers" in heartbeat_resource:
                 self.alive_workers = max(0, int(heartbeat_resource.get("alive_workers", 0) or 0))
+                self.method_failures = {
+                    str(k): dict(v) if isinstance(v, dict) else {"reason": str(v)}
+                    for k, v in dict(heartbeat_resource.get("method_failures") or {}).items()
+                }
+                self.readiness = str(heartbeat_resource.get("readiness", self.readiness) or "")
+                self.readiness_reason = str(heartbeat_resource.get("readiness_reason", self.readiness_reason) or "")
+                self.create_stage = str(heartbeat_resource.get("create_stage", self.create_stage) or "")
+                self.status = str(heartbeat_resource.get("status", self.status) or "")
             elif hasattr(resp, "alive_workers"):
                 self.alive_workers = max(0, int(getattr(resp, "alive_workers", 0) or 0))
         return resp
@@ -284,6 +293,7 @@ class ServiceSessionClient:
     readiness: str = "ready"
     readiness_reason: str = ""
     create_stage: str = ""
+    method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
     operation_id: str = ""
     operation_updated_at: str = ""
     signal_cursor: int = 0
@@ -379,6 +389,13 @@ class ServiceSessionClient:
         with contextlib.suppress(Exception):
             if isinstance(heartbeat_resource, dict) and "alive_workers" in heartbeat_resource:
                 self.alive_workers = max(0, int(heartbeat_resource.get("alive_workers", 0) or 0))
+                self.method_failures = {
+                    str(k): dict(v) if isinstance(v, dict) else {"reason": str(v)}
+                    for k, v in dict(heartbeat_resource.get("method_failures") or {}).items()
+                }
+                self.readiness = str(heartbeat_resource.get("readiness", self.readiness) or "")
+                self.readiness_reason = str(heartbeat_resource.get("readiness_reason", self.readiness_reason) or "")
+                self.create_stage = str(heartbeat_resource.get("create_stage", self.create_stage) or "")
             elif hasattr(resp, "alive_workers"):
                 self.alive_workers = max(0, int(getattr(resp, "alive_workers", 0) or 0))
         now = _utc_now()

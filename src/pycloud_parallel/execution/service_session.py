@@ -86,10 +86,18 @@ from pycloud_parallel.execution.managed_globals import update_managed_globals_ac
 from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
+    format_replica_create_failure,
+    is_permanent_replica_create_failure,
     normalize_initial_globals,
     prepare_deployment_artifact,
     run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
+)
+from pycloud_parallel.execution.dependency_failover import (
+    dependency_failure_reason,
+    dependency_method_blocked,
+    dependency_missing_module,
+    is_dependency_failure,
 )
 from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.base import ExecutionItem, SLOW_COMPENSATION_LOG_SEC, ServiceExecutionSession
@@ -905,6 +913,7 @@ class _ConnectedService:
         self._discovered_methods: Optional[List[str]] = None
         self._last_status: Optional[Dict[str, object]] = None
         self._route_notice_emitted = False
+        self._method_node_blacklist: Dict[str, Dict[str, str]] = {}
         self._async_call_gate: Optional[asyncio.Semaphore] = None
         self._async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_call_gate_capacity = 0
@@ -1218,23 +1227,42 @@ class _ConnectedService:
                 **prepare_kwargs,
             )
 
-    def _discoverable_routes(self, *, force_refresh: bool = False) -> List[InfoCenterServiceRoute]:
+    def _discoverable_routes(self, *, force_refresh: bool = False, method: str = "") -> List[InfoCenterServiceRoute]:
         if self.route != "discovery":
             return []
         route_cache = self._route_cache
+        normalized_method = str(method or "").strip()
         routes: List[InfoCenterServiceRoute] = []
         if route_cache is not None:
-            if force_refresh:
+            if normalized_method and hasattr(route_cache, "refresh_for_method"):
+                with contextlib.suppress(Exception):
+                    routes = list(route_cache.refresh_for_method(self.service_name, method=normalized_method))
+            elif force_refresh:
                 with contextlib.suppress(Exception):
                     route_cache.refresh(self.service_name, force=True)
-            with contextlib.suppress(Exception):
-                routes = list(route_cache.get_routes(self.service_name))
+                with contextlib.suppress(Exception):
+                    routes = list(route_cache.get_routes(self.service_name))
+            else:
+                with contextlib.suppress(Exception):
+                    routes = list(route_cache.get_routes(self.service_name))
         routes = [route for route in routes if str(getattr(route, "service_name", "") or "").strip() == self.service_name]
+        if normalized_method:
+            routes = [
+                route
+                for route in routes
+                if not dependency_method_blocked(getattr(route, "method_failures", {}), method=normalized_method)
+            ]
         if routes:
             self._refresh_effective_policy_from_routes(routes)
             self._emit_route_notice_once(routes)
             return routes
         routes = self._discover_routes_from_nodes()
+        if normalized_method:
+            routes = [
+                route
+                for route in routes
+                if not dependency_method_blocked(getattr(route, "method_failures", {}), method=normalized_method)
+            ]
         self._refresh_effective_policy_from_routes(routes)
         self._emit_route_notice_once(routes)
         return routes
@@ -1292,6 +1320,7 @@ class _ConnectedService:
                         ema_samples=0,
                         predicted_busy=float(in_flight) / float(alive_workers),
                         policy_id=str(getattr(svc, "policy_id", "") or get_default_policy_id_for_binding("service_internal")),
+                        method_failures=dict(getattr(svc, "method_failures", {}) or {}),
                     )
                 )
         routes.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
@@ -1353,7 +1382,7 @@ class _ConnectedService:
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
@@ -1380,37 +1409,75 @@ class _ConnectedService:
             token = getattr(self._transport_client, "service_token", "")
 
             def _select_route():
+                method_blacklist = self._method_node_blacklist.get(str(method or "").strip(), {})
                 if route_cache is not None:
-                    return route_cache.select_route(
-                        self.service_name,
-                        exclude_service_ids=tried,
-                        strategy=strategy_name,
+                    route_rows = []
+                    with contextlib.suppress(Exception):
+                        route_rows = list(
+                            route_cache.refresh_for_method(self.service_name, method=method)
+                            if hasattr(route_cache, "refresh_for_method")
+                            else route_cache.get_routes(self.service_name)
+                        )
+                    max_route_attempts = max(1, len(route_rows) if route_rows else len(tried) + 1)
+                    for _attempt in range(max_route_attempts):
+                        selected = route_cache.select_route(
+                            self.service_name,
+                            exclude_service_ids=tried,
+                            strategy=strategy_name,
+                            method=method,
+                        )
+                        if self._client_mod._node_instance_key_from_route(selected) not in method_blacklist:
+                            return selected
+                        tried.add(str(getattr(selected, "service_id", "") or ""))
+                        with contextlib.suppress(Exception):
+                            route_cache.release_route(selected)
+                    raise RuntimeError(
+                        f"no available route for service_name={self.service_name!r}; "
+                        f"dependency blacklist for method={method}: {method_blacklist}"
                     )
                 candidates = [
                     item
-                    for item in self._discoverable_routes(force_refresh=True)
+                    for item in self._discoverable_routes(force_refresh=True, method=method)
                     if str(getattr(item, "service_id", "") or "") not in tried
+                ]
+                candidates = [
+                    item
+                    for item in candidates
+                    if self._client_mod._node_instance_key_from_route(item) not in method_blacklist
                 ]
                 if not candidates:
                     raise RuntimeError(f"no available route for service_name={self.service_name!r}")
                 return sorted(candidates, key=lambda item: _route_sort_key(item, strategy=strategy_name))[0]
 
             def _has_alternative() -> bool:
+                method_blacklist = self._method_node_blacklist.get(str(method or "").strip(), {})
                 if route_cache is not None:
                     with contextlib.suppress(Exception):
+                        route_rows = (
+                            route_cache.refresh_for_method(self.service_name, method=method)
+                            if hasattr(route_cache, "refresh_for_method")
+                            else route_cache.get_routes(self.service_name)
+                        )
                         cached = [
                             item
-                            for item in route_cache.get_routes(self.service_name)
+                            for item in route_rows
                             if str(getattr(item, "service_id", "") or "") not in tried
+                            and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
                         ]
                         if cached:
                             return True
                     with contextlib.suppress(Exception):
+                        route_rows = (
+                            route_cache.refresh_for_method(self.service_name, method=method)
+                            if hasattr(route_cache, "refresh_for_method")
+                            else route_cache.refresh(self.service_name, force=True)
+                        )
                         return bool(
                             [
                                 item
-                                for item in route_cache.refresh(self.service_name, force=True)
+                                for item in route_rows
                                 if str(getattr(item, "service_id", "") or "") not in tried
+                                and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
                             ]
                         )
                     return True
@@ -1418,8 +1485,9 @@ class _ConnectedService:
                     return bool(
                         [
                             item
-                            for item in self._discoverable_routes(force_refresh=True)
+                            for item in self._discoverable_routes(force_refresh=True, method=method)
                             if str(getattr(item, "service_id", "") or "") not in tried
+                            and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
                         ]
                     )
                 return True
@@ -1491,6 +1559,11 @@ class _ConnectedService:
                     return node_id, response
                 except self._client_mod.DiscoveryCallError as exc:
                     last_error = exc
+                    if is_dependency_failure(exc):
+                        node_key = self._client_mod._node_instance_key_from_route(route)
+                        self._method_node_blacklist.setdefault(str(method or "").strip(), {})[node_key] = (
+                            dependency_failure_reason(exc, method=method)
+                        )
                     failure_kind = classify_service_error(exc, route_failure=self._client_mod._is_route_failure(exc))
                     if not should_failover(failure_kind, has_alternative_candidate=_has_alternative()):
                         if route_cache is not None:
@@ -1537,7 +1610,7 @@ class _ConnectedService:
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
@@ -1563,7 +1636,7 @@ class _ConnectedService:
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         max_concurrency: int = 100,
     ):
         del max_concurrency
@@ -1605,7 +1678,7 @@ class _ConnectedService:
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         serialization_mode: str = "",
@@ -1684,10 +1757,14 @@ class _ConnectedService:
         if self.route != "discovery":
             raise NotImplementedError(f"stream_call does not support route={self.route!r}")
         route = (
-            self._route_cache.select_route(self.service_name, strategy=resolve_service_strategy(strategy)[0])
+            self._route_cache.select_route(
+                self.service_name,
+                strategy=resolve_service_strategy(strategy)[0],
+                method=method,
+            )
             if self._route_cache is not None
             else sorted(
-                self._discoverable_routes(force_refresh=True),
+                self._discoverable_routes(force_refresh=True, method=method),
                 key=lambda item: _route_sort_key(item, strategy=resolve_service_strategy(strategy)[0]),
             )[0]
         )
@@ -1741,7 +1818,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1768,7 +1845,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1793,7 +1870,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1819,7 +1896,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1845,7 +1922,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1869,7 +1946,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1894,7 +1971,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -1918,7 +1995,7 @@ class _ConnectedService:
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
@@ -2005,6 +2082,8 @@ class Service(ServiceExecutionSession):
     _route_index: int = field(default=0, repr=False)
     _route_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _breaker_states: Dict[str, CandidateBreakerState] = field(default_factory=dict, repr=False)
+    _method_node_blacklist: Dict[str, Dict[str, str]] = field(default_factory=dict, repr=False)
+    _dependency_failure_methods_by_node: Dict[str, Set[str]] = field(default_factory=dict, repr=False)
     _discovered_methods: Optional[List[str]] = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     _async_call_gate: Optional[asyncio.Semaphore] = field(default=None, repr=False)
@@ -2016,6 +2095,10 @@ class Service(ServiceExecutionSession):
     _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_compensation_attempt_at: float = field(default=0.0, repr=False)
     _last_compensation_decision_log_at: float = field(default=0.0, repr=False)
+    _owner_node_blacklist: Dict[str, str] = field(default_factory=dict, repr=False)
+    # Backward-compatible alias for older tests/debug scripts. This blacklist now
+    # covers create failures, runtime dependency failures, and repeated disconnects.
+    _create_failure_node_blacklist: Dict[str, str] = field(default_factory=dict, repr=False)
     _last_managed_globals: Optional[Dict[str, object]] = field(default=None, repr=False)
     _async_globals_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _async_globals_executor: Optional[ThreadPoolExecutor] = field(default=None, repr=False)
@@ -2143,6 +2226,46 @@ class Service(ServiceExecutionSession):
     def _is_retryable_compensation_failure(message: str) -> bool:
         return is_retryable_compensation_failure(message, resource_kind="service")
 
+    def _mark_create_failure_node_blacklisted(self, node: InfoCenterNode, message: object) -> None:
+        if not is_permanent_replica_create_failure(message, resource_kind="service"):
+            return
+        node_instance_id = _node_instance_key_from_node(node)
+        if not node_instance_id:
+            return
+        self._owner_node_blacklist[node_instance_id] = format_replica_create_failure(
+            message,
+            resource_kind="service",
+        )
+
+    def _create_failure_node_block_reason(self, node: InfoCenterNode) -> str:
+        node_instance_id = _node_instance_key_from_node(node)
+        if not node_instance_id:
+            return ""
+        return str(self._owner_node_blacklist.get(node_instance_id, "") or "")
+
+    def _mark_replica_node_instance_blacklisted(self, node_instance_id: str, reason: str) -> None:
+        normalized = str(node_instance_id or "").strip()
+        if not normalized:
+            return
+        self._owner_node_blacklist[normalized] = str(reason or "").strip() or "replica unavailable"
+
+    def _mark_owner_node_instance_blacklisted(self, node_instance_id: str, reason: str) -> None:
+        normalized = str(node_instance_id or "").strip()
+        if not normalized:
+            return
+        self._owner_node_blacklist[normalized] = str(reason or "").strip() or "replica unavailable"
+        self.failures[normalized] = self._owner_node_blacklist[normalized]
+        session = self.sessions.get(normalized)
+        if session is not None:
+            if hasattr(session, "failed"):
+                session.failed = True
+            if hasattr(session, "last_error"):
+                session.last_error = self._owner_node_blacklist[normalized]
+        self._discard_active_replica(normalized)
+        self._discard_retry_probe_replica(normalized)
+        self._mark_terminal_replica(normalized)
+        self._wake_keepalive()
+
     def _after_keepalive_tick(self) -> None:
         self._maybe_submit_compensation_after_tick(self._compensation_spec, resource_name=self.service_name)
 
@@ -2232,7 +2355,7 @@ class Service(ServiceExecutionSession):
             retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
             excluded = set(deployed_active)
             list_started_at = time.monotonic()
-            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
+            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0)) as infocenter:
                 discovered_nodes = list(
                     infocenter.list_nodes(
                         healthy_only=bool(spec.get("healthy_only", True)),
@@ -2270,10 +2393,16 @@ class Service(ServiceExecutionSession):
                     )
                 )
             raw_candidate_node_ids = [_node_instance_key_from_node(node) for node in candidate_nodes if _node_instance_key_from_node(node)]
+            create_failure_blocked = {
+                _node_instance_key_from_node(node): self._create_failure_node_block_reason(node)
+                for node in candidate_nodes
+                if self._create_failure_node_block_reason(node)
+            }
             candidates = [
                 node
                 for node in candidate_nodes
                 if _node_instance_key_from_node(node) not in excluded
+                and not self._create_failure_node_block_reason(node)
                 and not (
                     _node_instance_key_from_node(node) in failed
                     and _node_instance_key_from_node(node) not in retryable_failed
@@ -2335,7 +2464,7 @@ class Service(ServiceExecutionSession):
                         sorted(self._retry_probe_replica_snapshot()),
                         sorted(failed),
                         sorted(retryable_failed),
-                        "no eligible candidate",
+                        "owner node blacklist" if create_failure_blocked else "no eligible candidate",
                     )
                 return 0
             missing = max(0, desired - len(active))
@@ -2346,7 +2475,7 @@ class Service(ServiceExecutionSession):
                 node_key = _node_instance_key_from_node(node)
                 try:
                     target = _node_control_target_for_node(node)
-                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0))
                 except Exception as exc:
                     return node_key, node, None, None, repr(exc)
                 node_worker_count = max(1, int(spec.get("worker_count", 1) or 1))
@@ -2382,6 +2511,7 @@ class Service(ServiceExecutionSession):
                             )
                         ),
                         wait_ready=False,
+                        timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0),
                     )
                     create_rpc_sec += time.monotonic() - create_started_at
                 except Exception as exc:
@@ -2400,23 +2530,25 @@ class Service(ServiceExecutionSession):
                 if error_message:
                     with self._route_lock:
                         self.failures[node_key] = error_message
+                        self._mark_create_failure_node_blacklisted(node, error_message)
                     category = classify_error(error_message, resource_kind="service").value
                     _mark_infocenter_node_lost_on_identity_mismatch(
                         infocenter_factory=_infocenter_client,
                         infocenter_target=str(spec["infocenter_target"]),
-                        timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0),
+                        timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0),
                         node_instance_id=node_key,
                         error_message=error_message,
                         reason_prefix="service compensation identity mismatch",
                     )
                     logger.warning(
                         "service dynamic compensation create failed service_name=%s "
-                        "node_id=%s node_instance_id=%s control_addr=%s category=%s err=%s",
+                        "node_id=%s node_instance_id=%s control_addr=%s category=%s missing_module=%s err=%s",
                         self.service_name,
                         getattr(node, "node_id", ""),
                         node_key,
                         getattr(node, "control_addr", ""),
                         category,
+                        dependency_missing_module(error_message),
                         error_message,
                     )
                     continue
@@ -2748,7 +2880,7 @@ class Service(ServiceExecutionSession):
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
     ):
         del serialization_mode, chunk_size, timeout_sec
         from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
@@ -2883,7 +3015,7 @@ class Service(ServiceExecutionSession):
         node_limit: int = 100,
         allow_partial: bool = True,
         min_success_nodes: int = 1,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
         replace_existing_if_code_changed: bool = True,
@@ -2968,7 +3100,7 @@ class Service(ServiceExecutionSession):
         *,
         target: str,
         service_name: str,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         service_token: str = "",
         route: str = "discovery",
         protocol: str = "http",
@@ -2993,7 +3125,7 @@ class Service(ServiceExecutionSession):
         *,
         target: str,
         service_name: str,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         service_token: str = "",
         route: str = "discovery",
         protocol: str = "http",
@@ -3102,7 +3234,7 @@ class Service(ServiceExecutionSession):
         node_limit: int = 100,
         allow_partial: bool = True,
         min_success_nodes: int = 1,
-        timeout_sec: float = 10.0,
+        timeout_sec: float = 600.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
         replace_existing_if_code_changed: bool = True,
@@ -3121,39 +3253,39 @@ class Service(ServiceExecutionSession):
         expose the frozen `effective_policy` that actually took effect.
 
         Args:
-            infocenter_target: InfoCenter 地址
-            source: 默认产品化代码输入；可传 callable / module / path / bytes
-            owner_client_id: 所有者 ID
-            service_name: 服务名称
-            artifact: 高级 Artifact 声明对象
-            runtime: 运行时版本
-            entry_module: 入口模块名，或可导入的真实模块对象
-            entry_callable: 入口函数名，或真实函数对象
-            package_format: 包格式 ("py", "zip", "tar.gz")
-            worker_count: 工作进程数
-            heartbeat_timeout_sec: 心跳超时
-            idle_ttl_sec: 空闲 TTL
-            expose_http: 是否暴露 HTTP
-            chunk_size: 上传分片大小
-            healthy_only: 是否只使用健康节点
-            tags: 节点标签过滤
-            node_ids: 显式指定要部署到哪些节点
-            node_count: 需要挑选的节点数量；未指定时默认使用 min_success_nodes
-            node_limit: 节点数量限制
-            allow_partial: 是否允许部分失败
-            min_success_nodes: 最小成功节点数
-            timeout_sec: 超时时间
-            ensure_unique_service_name: 是否确保服务名唯一
-            reuse_existing_same_code: 同 owner + 同代码时是否直接复用已存在服务
-            replace_existing_if_code_changed: 同 owner + 同服务名但代码变化时是否替换（默认自动替换）
-            session_cache_dir: 本地 service session token 缓存目录
-            breaker_enabled: 是否启用熔断器
-            breaker_failure_threshold: 熔断失败阈值
-            breaker_cooldown_sec: 熔断冷却时间
-            breaker_max_cooldown_sec: 熔断最大冷却时间
+            infocenter_target: InfoCenter 鍦板潃
+            source: 榛樿浜у搧鍖栦唬鐮佽緭鍏ワ紱鍙紶 callable / module / path / bytes
+            owner_client_id: 鎵€鏈夎€?ID
+            service_name: 鏈嶅姟鍚嶇О
+            artifact: 楂樼骇 Artifact 澹版槑瀵硅薄
+            runtime: 杩愯鏃剁増鏈?
+            entry_module: 鍏ュ彛妯″潡鍚嶏紝鎴栧彲瀵煎叆鐨勭湡瀹炴ā鍧楀璞?
+            entry_callable: 鍏ュ彛鍑芥暟鍚嶏紝鎴栫湡瀹炲嚱鏁板璞?
+            package_format: 鍖呮牸寮?("py", "zip", "tar.gz")
+            worker_count: 宸ヤ綔杩涚▼鏁?
+            heartbeat_timeout_sec: 蹇冭烦瓒呮椂
+            idle_ttl_sec: 绌洪棽 TTL
+            expose_http: 鏄惁鏆撮湶 HTTP
+            chunk_size: 涓婁紶鍒嗙墖澶у皬
+            healthy_only: 鏄惁鍙娇鐢ㄥ仴搴疯妭鐐?
+            tags: 鑺傜偣鏍囩杩囨护
+            node_ids: 鏄惧紡鎸囧畾瑕侀儴缃插埌鍝簺鑺傜偣
+            node_count: 闇€瑕佹寫閫夌殑鑺傜偣鏁伴噺锛涙湭鎸囧畾鏃堕粯璁や娇鐢?min_success_nodes
+            node_limit: 鑺傜偣鏁伴噺闄愬埗
+            allow_partial: 鏄惁鍏佽閮ㄥ垎澶辫触
+            min_success_nodes: 鏈€灏忔垚鍔熻妭鐐规暟
+            timeout_sec: 瓒呮椂鏃堕棿
+            ensure_unique_service_name: 鏄惁纭繚鏈嶅姟鍚嶅敮涓€
+            reuse_existing_same_code: 鍚?owner + 鍚屼唬鐮佹椂鏄惁鐩存帴澶嶇敤宸插瓨鍦ㄦ湇鍔?
+            replace_existing_if_code_changed: 鍚?owner + 鍚屾湇鍔″悕浣嗕唬鐮佸彉鍖栨椂鏄惁鏇挎崲锛堥粯璁よ嚜鍔ㄦ浛鎹級
+            session_cache_dir: 鏈湴 service session token 缂撳瓨鐩綍
+            breaker_enabled: 鏄惁鍚敤鐔旀柇鍣?
+            breaker_failure_threshold: 鐔旀柇澶辫触闃堝€?
+            breaker_cooldown_sec: 鐔旀柇鍐峰嵈鏃堕棿
+            breaker_max_cooldown_sec: 鐔旀柇鏈€澶у喎鍗存椂闂?
 
         Returns:
-            Service: 部署的服务组
+            Service: 閮ㄧ讲鐨勬湇鍔＄粍
         """
         effective_api_token = _resolve_owner_api_token(api_token)
         initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
@@ -3183,34 +3315,34 @@ class Service(ServiceExecutionSession):
         requested_policy_id = str(policy_id or "").strip().lower()
         normalized_policy_id = requested_policy_id or get_default_policy_id_for_binding("service_internal")
 
-        # 生成默认的 owner_client_id 和 service_name
+        # 鐢熸垚榛樿鐨?owner_client_id 鍜?service_name
         local_ip = _get_local_ip()
 
-        # 如果 owner_client_id 为空，使用本机 IP
+        # 濡傛灉 owner_client_id 涓虹┖锛屼娇鐢ㄦ湰鏈?IP
         effective_owner_client_id = owner_client_id
         if not effective_owner_client_id:
             effective_owner_client_id = f"client-{local_ip}"
 
-        # 先确定 entry_module（用于生成 service_name）
+        # 鍏堢‘瀹?entry_module锛堢敤浜庣敓鎴?service_name锛?
         if not effective_entry_module:
             if effective_filename:
-                # 优先使用推导出的 artifact 文件名
+                # 浼樺厛浣跨敤鎺ㄥ鍑虹殑 artifact 鏂囦欢鍚?
                 if effective_filename.endswith(".py"):
                     effective_entry_module = Path(effective_filename).stem
 
-        # 如果 service_name 为空，使用 entry_module + 本机 IP + 时间戳（精确到秒）
-        # 添加时间戳确保唯一性，避免服务名冲突
+        # 濡傛灉 service_name 涓虹┖锛屼娇鐢?entry_module + 鏈満 IP + 鏃堕棿鎴筹紙绮剧‘鍒扮锛?
+        # 娣诲姞鏃堕棿鎴崇‘淇濆敮涓€鎬э紝閬垮厤鏈嶅姟鍚嶅啿绐?
         effective_service_name = service_name
         if not effective_service_name:
-            # 生成时间戳（精确到秒）
-            timestamp = time.strftime("%Y%m%d%H%M%S")  # 格式: 20250330120000
+            # 鐢熸垚鏃堕棿鎴筹紙绮剧‘鍒扮锛?
+            timestamp = time.strftime("%Y%m%d%H%M%S")  # 鏍煎紡: 20250330120000
 
             if effective_entry_module:
                 effective_service_name = f"{effective_entry_module}-{local_ip}-{timestamp}"
             else:
                 effective_service_name = f"service-{local_ip}-{timestamp}"
 
-        # 现在才进行校验
+        # 鐜板湪鎵嶈繘琛屾牎楠?
         if not effective_owner_client_id:
             raise ValueError("owner_client_id is required")
         if not effective_service_name:
@@ -3589,8 +3721,25 @@ class Service(ServiceExecutionSession):
             clients: Dict[str, Any] = {}
             nodes: Dict[str, InfoCenterNode] = {}
             failures: Dict[str, str] = {}
+            create_failure_node_blacklist: Dict[str, str] = {}
             create_request_namespace = uuid.uuid4().hex
             create_request_ids: Dict[str, str] = {}
+
+            def _mark_deploy_create_failure(node: InfoCenterNode, message: object) -> None:
+                if not is_permanent_replica_create_failure(message, resource_kind="service"):
+                    return
+                node_instance_id = _node_instance_key_from_node(node)
+                if node_instance_id:
+                    create_failure_node_blacklist[node_instance_id] = format_replica_create_failure(
+                        message,
+                        resource_kind="service",
+                    )
+
+            def _deploy_create_failure_block_reason(node: InfoCenterNode) -> str:
+                node_instance_id = _node_instance_key_from_node(node)
+                if not node_instance_id:
+                    return ""
+                return str(create_failure_node_blacklist.get(node_instance_id, "") or "")
 
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
@@ -3628,6 +3777,7 @@ class Service(ServiceExecutionSession):
                             node_key,
                             f"service-create:{effective_owner_client_id}:{effective_service_name}:{create_request_namespace}:{node_key}",
                         ),
+                        timeout_sec=timeout_sec,
                     )
                 except Exception as exc:
                     client.close()
@@ -3651,6 +3801,7 @@ class Service(ServiceExecutionSession):
                         node_key = _node_instance_key_from_node(item.node)
                         error_message = item.error_message
                         failures[node_key] = error_message
+                        _mark_deploy_create_failure(item.node, error_message)
                         if _is_node_identity_mismatch_error(error_message):
                             _mark_infocenter_node_lost_on_identity_mismatch(
                                 infocenter_factory=_infocenter_client,
@@ -3662,12 +3813,13 @@ class Service(ServiceExecutionSession):
                             )
                         logger.warning(
                             "service replica create failed service_name=%s node_id=%s "
-                            "node_instance_id=%s control_addr=%s category=%s err=%s",
+                            "node_instance_id=%s control_addr=%s category=%s missing_module=%s err=%s",
                             effective_service_name,
                             getattr(item.node, "node_id", ""),
                             node_key,
                             getattr(item.node, "control_addr", ""),
                             classify_error(error_message, resource_kind="service").value,
+                            dependency_missing_module(error_message),
                             error_message,
                         )
                         if not first_failure[0]:
@@ -3676,6 +3828,7 @@ class Service(ServiceExecutionSession):
                     node_key, node, client, session, error_message = item.created
                     if error_message:
                         failures[node_key] = error_message
+                        _mark_deploy_create_failure(node, error_message)
                         if _is_node_identity_mismatch_error(error_message):
                             _mark_infocenter_node_lost_on_identity_mismatch(
                                 infocenter_factory=_infocenter_client,
@@ -3687,12 +3840,13 @@ class Service(ServiceExecutionSession):
                             )
                         logger.warning(
                             "service replica create failed service_name=%s node_id=%s "
-                            "node_instance_id=%s control_addr=%s category=%s err=%s",
+                            "node_instance_id=%s control_addr=%s category=%s missing_module=%s err=%s",
                             effective_service_name,
                             getattr(node, "node_id", ""),
                             node_key,
                             getattr(node, "control_addr", ""),
                             classify_error(error_message, resource_kind="service").value,
+                            dependency_missing_module(error_message),
                             error_message,
                         )
                         if not first_failure[0]:
@@ -3746,12 +3900,14 @@ class Service(ServiceExecutionSession):
                             for node_id in requested_node_ids
                             if node_id in fresh_node_map
                             and _node_instance_key_from_node(fresh_node_map[node_id]) not in tried_node_keys
+                            and not _deploy_create_failure_block_reason(fresh_node_map[node_id])
                         ]
                     else:
                         rediscovered_candidates = [
                             node
                             for node in _auto_candidate_nodes(fresh_discovered_nodes)
                             if _node_instance_key_from_node(node) not in tried_node_keys
+                            and not _deploy_create_failure_block_reason(node)
                         ]
                     if not rediscovered_candidates:
                         return
@@ -3785,6 +3941,7 @@ class Service(ServiceExecutionSession):
                     node
                     for node in _auto_candidate_nodes(discovered_nodes)
                     if _node_instance_key_from_node(node) not in tried_node_keys
+                    and not _deploy_create_failure_block_reason(node)
                 ]
                 if fallback_nodes:
                     _emit_owner_notice(
@@ -3840,6 +3997,8 @@ class Service(ServiceExecutionSession):
                 policy_id=normalized_policy_id,
                 effective_policy=effective_policy,
             )
+            group._owner_node_blacklist.update(create_failure_node_blacklist)  # noqa: SLF001
+            group._create_failure_node_blacklist = group._owner_node_blacklist  # noqa: SLF001
             group._configure_dynamic_compensation(_dynamic_compensation_spec())
             group._persist_session_cache()
             group._start_keepalive()
@@ -3990,10 +4149,11 @@ class Service(ServiceExecutionSession):
                 "set reuse_existing_same_code=True to reuse"
             )
         if cache_payload is None or cache_payload.get("artifact_code_version") != artifact_code_version:
-            raise RuntimeError(
-                f"service_name already exists with same code_version but no reusable local token cache was found: "
-                f"{service_name}"
+            _emit_owner_notice(
+                "existing same-code service has no reusable local token cache; "
+                f"service_name={service_name}; deploying fresh replica"
             )
+            return None
         try:
             session_cache_lock = _acquire_service_session_lock_with_retry(
                 session_cache_file,
@@ -4051,7 +4211,7 @@ class Service(ServiceExecutionSession):
         active_routes: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
         timeout_sec: float,
         session_cache_file: Path,
-    ) -> _ServiceSessionFileLock:
+    ) -> Optional[_ServiceSessionFileLock]:
         if not replace_existing_if_code_changed:
             raise RuntimeError(
                 f"service_name already exists with different code_version and is still running: "
@@ -4059,10 +4219,12 @@ class Service(ServiceExecutionSession):
                 "stop the active service first, then redeploy with the same service_name"
             )
         if cache_payload is None:
-            raise RuntimeError(
-                f"service_name already exists with different code_version but no local token cache was found: "
-                f"{service_name}; existing={existing_code_version}; incoming={incoming_code_version}"
+            _emit_owner_notice(
+                "existing changed-code service has no reusable local token cache; "
+                f"service_name={service_name}; existing={existing_code_version}; "
+                f"incoming={incoming_code_version}; deploying fresh replica"
             )
+            return None
         try:
             session_cache_lock = _acquire_service_session_lock_with_retry(
                 session_cache_file,
@@ -4240,7 +4402,16 @@ class Service(ServiceExecutionSession):
                         ),
                     ),
                     worker_count=max(1, int(cached_node.get("worker_count", 0) or info.worker_count or route.worker_count or 1)),
-                    alive_workers=max(0, int(getattr(info, "alive_workers", 0) or route.alive_workers or info.worker_count or route.worker_count or 1)),
+                    alive_workers=max(
+                        0,
+                        int(
+                            getattr(info, "alive_workers", 0)
+                            or getattr(route, "alive_workers", 0)
+                            or info.worker_count
+                            or route.worker_count
+                            or 1
+                        ),
+                    ),
                     status=hb.status or info.status,
                     service_name=str(info.service_name or route.service_name or ""),
                     node_instance_id=str(route_key or ""),
@@ -4403,6 +4574,9 @@ class Service(ServiceExecutionSession):
             pass
 
     def __post_init__(self, policy_id: str = "") -> None:
+        if self._create_failure_node_blacklist and not self._owner_node_blacklist:
+            self._owner_node_blacklist.update(self._create_failure_node_blacklist)
+        self._create_failure_node_blacklist = self._owner_node_blacklist
         self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
         self._init_execution_session_state()
         self._policy_id = str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal")
@@ -4736,23 +4910,40 @@ class Service(ServiceExecutionSession):
                     thread = self._hb_thread
                 if thread is None or not thread.is_alive():
                     self._sync_failures_from_replicas()
-                    if self.failures:
-                        _emit_owner_notice(
-                            f"owner keepalive stopped service_name={self.service_name} failures={self.failures}"
-                        )
+                    active = sorted(self._active_replica_snapshot()) if hasattr(self, "_active_replica_ids") else []
+                    retry_probe = sorted(self._retry_probe_replica_snapshot()) if hasattr(self, "_retry_probe_replica_ids") else []
+                    terminal = sorted(getattr(self, "_terminal_replica_ids", set()) or [])
+                    remaining_text = ""
+                    if deadline is not None:
+                        remaining_text = f" remaining_sec={max(0.0, deadline - time.monotonic()):.3f}"
+                    _emit_owner_notice(
+                        f"owner keepalive stopped service_name={self.service_name}"
+                        f"{remaining_text} active={active} retry_probe={retry_probe} "
+                        f"terminal={terminal} failures={self.failures}"
+                    )
                     return
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        _emit_owner_notice(
+                            f"join timeout reached service_name={self.service_name} "
+                            f"timeout_sec={max(0.0, float(timeout or 0.0)):.3f}"
+                        )
                         return
                     current_wait = min(wait_sec, remaining)
                 else:
                     current_wait = wait_sec
                 thread.join(timeout=current_wait)
                 if signal_event.is_set():
+                    _emit_owner_notice(
+                        f"join interrupted service_name={self.service_name} reason={end_reason}"
+                    )
                     _close_for_interrupt(end_reason)
                     return
         except KeyboardInterrupt:
+            _emit_owner_notice(
+                f"join keyboard interrupt service_name={self.service_name} reason={end_reason}"
+            )
             _close_for_interrupt(end_reason)
             return
         finally:
@@ -4816,7 +5007,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
     ) -> Dict[str, object]:
         node_key = self._resolve_node_key(node_id)
         session = self.sessions.get(node_key)
@@ -4830,8 +5021,85 @@ class Service(ServiceExecutionSession):
             effective_policy=self.effective_policy,
         )
 
-    def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
-        excluded = exclude or set()
+    def _method_blacklisted_nodes(self, method: str) -> Dict[str, str]:
+        normalized_method = str(method or "").strip()
+        if not normalized_method:
+            return {}
+        return dict(self._method_node_blacklist.get(normalized_method, {}) or {})
+
+    def _mark_method_node_blacklisted(self, method: str, node_id: str, reason: object) -> None:
+        normalized_method = str(method or "").strip()
+        normalized_node = str(node_id or "").strip()
+        if not normalized_method or not normalized_node:
+            return
+        reason_text = dependency_failure_reason(
+            reason,
+            method=normalized_method,
+        )
+        self._method_node_blacklist.setdefault(normalized_method, {})[normalized_node] = reason_text
+        methods = self._dependency_failure_methods_by_node.setdefault(normalized_node, set())
+        methods.add(normalized_method)
+        self._maybe_blacklist_dependency_failed_node_instance(normalized_node, methods=methods, last_reason=reason_text)
+
+    def _on_replica_method_failures_reported(self, node_id: str, replica: object, method_failures: Dict[str, object]) -> None:
+        del replica
+        normalized_node = str(node_id or "").strip()
+        if not normalized_node or not method_failures:
+            return
+        methods = self._dependency_failure_methods_by_node.setdefault(normalized_node, set())
+        last_reason = ""
+        for method, detail in dict(method_failures or {}).items():
+            normalized_method = str(method or "").strip()
+            if not normalized_method:
+                continue
+            if isinstance(detail, dict):
+                raw_reason = str(detail.get("reason") or detail.get("error") or detail or "")
+            else:
+                raw_reason = str(detail or "")
+            reason_text = dependency_failure_reason(raw_reason or "dependency runtime error", method=normalized_method)
+            self._method_node_blacklist.setdefault(normalized_method, {})[normalized_node] = reason_text
+            methods.add(normalized_method)
+            last_reason = reason_text
+        if methods:
+            self._maybe_blacklist_dependency_failed_node_instance(
+                normalized_node,
+                methods=methods,
+                last_reason=last_reason or "node reported dependency runtime failures",
+            )
+
+    def _maybe_blacklist_dependency_failed_node_instance(
+        self,
+        node_id: str,
+        *,
+        methods: Set[str],
+        last_reason: str,
+    ) -> None:
+        normalized_node = str(node_id or "").strip()
+        if not normalized_node:
+            return
+        exported_methods = [
+            str(item or "").strip()
+            for item in list(self._discovered_methods or [])
+            if str(item or "").strip()
+        ]
+        total_methods = len(exported_methods)
+        severe = len(methods) > 2 or (
+            total_methods > 0 and (float(len(methods)) / float(total_methods)) > 0.30
+        )
+        if severe:
+            self._mark_owner_node_instance_blacklisted(
+                normalized_node,
+                (
+                    "runtime dependency failure threshold exceeded "
+                    f"methods={sorted(methods)} failed_count={len(methods)} "
+                    f"exported_count={total_methods or 'unknown'} last_reason={last_reason}"
+                ),
+            )
+
+    def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None, method: str = "") -> str:
+        excluded = set(exclude or set())
+        method_blacklist = self._method_blacklisted_nodes(method)
+        excluded.update(method_blacklist.keys())
         normalized_strategy, profile = resolve_service_strategy(strategy)
         active_replica_ids = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else None
 
@@ -4862,7 +5130,13 @@ class Service(ServiceExecutionSession):
             state_rank[node_id] = 0 if breaker_state == "closed" else 1
             candidates.append(node_id)
         if not candidates:
-            raise RuntimeError("no available service node (all candidates may be initializing, failed, or open-circuit)")
+            detail = ""
+            if method_blacklist:
+                detail = f"; dependency blacklist for method={str(method or '').strip()}: {method_blacklist}"
+            raise RuntimeError(
+                "no available service node (all candidates may be initializing, failed, open-circuit, or dependency-blacklisted)"
+                + detail
+            )
 
         if normalized_strategy == "round_robin":
             if refresh_status:
@@ -4971,12 +5245,25 @@ class Service(ServiceExecutionSession):
             self._route_index += 1
         return candidates[idx]
 
+    def _can_accept_call_response_from_node(self, node_id: str, session: object) -> bool:
+        normalized = str(node_id or "").strip()
+        if not normalized:
+            return False
+        current = self.sessions.get(normalized)
+        if current is not session:
+            return False
+        if not self._is_current_replica(normalized, session):
+            return False
+        active_snapshot = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else set()
+        retry_probe = self._retry_probe_replica_snapshot() if hasattr(self, "_retry_probe_replica_ids") else set()
+        return normalized in active_snapshot or normalized in retry_probe
+
     def call_balanced(
         self,
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
@@ -4995,11 +5282,17 @@ class Service(ServiceExecutionSession):
         last_error: Optional[Exception] = None
 
         for _ in range(tries):
-            node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
+            node_id = self._select_node(
+                strategy=strategy,
+                refresh_status=refresh_status,
+                exclude=excluded,
+                method=method,
+            )
             excluded.add(node_id)
             if not self._breaker_before_invoke(node_id):
                 continue
             try:
+                session = self.sessions[node_id]
                 call_kwargs = {
                     "timeout_sec": timeout_sec,
                 }
@@ -5007,15 +5300,19 @@ class Service(ServiceExecutionSession):
                     call_kwargs["serialization_mode"] = effective_serialization_mode
                 if self.effective_policy is not None:
                     call_kwargs["effective_policy"] = self.effective_policy
-                resp = self.sessions[node_id].call(
+                resp = session.call(
                     method,
                     payload,
                     **call_kwargs,
                 )
+                if not self._can_accept_call_response_from_node(node_id, session):
+                    raise RuntimeError(f"service replica response ignored for untrusted replica: {node_id}")
                 self._breaker_mark_success(node_id)
                 return node_id, resp
             except Exception as exc:
                 last_error = exc
+                if is_dependency_failure(exc):
+                    self._mark_method_node_blacklisted(method, node_id, exc)
                 failure_kind = classify_service_error(exc)
                 self._breaker_mark_failure(node_id, exc)
                 if not should_failover(
@@ -5024,35 +5321,37 @@ class Service(ServiceExecutionSession):
                 ):
                     raise RuntimeError(str(exc)) from exc
 
-        raise RuntimeError(f"call failed on all candidate nodes: {last_error}")
+        blacklist = self._method_blacklisted_nodes(method)
+        suffix = f"; dependency blacklist for method={method}: {blacklist}" if blacklist else ""
+        raise RuntimeError(f"call failed on all candidate nodes: {last_error}{suffix}")
 
     async def acall_balanced(
         self,
         method: str,
         payload: Dict[str, object],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
-        """异步版本的 call_balanced。
+        """寮傛鐗堟湰鐨?call_balanced銆?
 
-        使用 asyncio 在线程池中执行同步 HTTP 调用，不阻塞事件循环。
+        浣跨敤 asyncio 鍦ㄧ嚎绋嬫睜涓墽琛屽悓姝?HTTP 璋冪敤锛屼笉闃诲浜嬩欢寰幆銆?
 
         Args:
-            method: 服务方法名
-            payload: 调用参数
-            timeout_sec: 超时时间
-            strategy: 节点选择策略（"predicted_busy"、"least_inflight" 或 "round_robin"）
-            refresh_status: 是否在选择节点前刷新状态
-            max_attempts: 最大尝试次数
+            method: 鏈嶅姟鏂规硶鍚?
+            payload: 璋冪敤鍙傛暟
+            timeout_sec: 瓒呮椂鏃堕棿
+            strategy: 鑺傜偣閫夋嫨绛栫暐锛?predicted_busy"銆?least_inflight" 鎴?"round_robin"锛?
+            refresh_status: 鏄惁鍦ㄩ€夋嫨鑺傜偣鍓嶅埛鏂扮姸鎬?
+            max_attempts: 鏈€澶у皾璇曟鏁?
         Returns:
-            Tuple[str, Dict[str, object]]: (节点 ID, 响应结果)
+            Tuple[str, Dict[str, object]]: (鑺傜偣 ID, 鍝嶅簲缁撴灉)
 
         Raises:
-            RuntimeError: 所有节点都调用失败时
+            RuntimeError: 鎵€鏈夎妭鐐归兘璋冪敤澶辫触鏃?
         """
         if not self.sessions:
             raise RuntimeError("Service session has no active replicas")
@@ -5069,29 +5368,39 @@ class Service(ServiceExecutionSession):
         loop = asyncio.get_running_loop()
         async with self._get_async_call_gate():
             for _ in range(tries):
-                node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
+                node_id = self._select_node(
+                    strategy=strategy,
+                    refresh_status=refresh_status,
+                    exclude=excluded,
+                    method=method,
+                )
                 excluded.add(node_id)
                 if not self._breaker_before_invoke(node_id):
                     continue
                 try:
-                    # 在线程池中执行同步调用，不阻塞事件循环
+                    # 鍦ㄧ嚎绋嬫睜涓墽琛屽悓姝ヨ皟鐢紝涓嶉樆濉炰簨浠跺惊鐜?
                     call_kwargs = {
                         "timeout_sec": timeout_sec,
                     }
                     if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
                         call_kwargs["serialization_mode"] = effective_serialization_mode
+                    session = self.sessions[node_id]
                     resp = await loop.run_in_executor(
                         self._get_async_call_executor(),
-                        lambda nid=node_id, kwargs=call_kwargs: self.sessions[nid].call(
+                        lambda sess=session, kwargs=call_kwargs: sess.call(
                             method,
                             payload,
                             **kwargs,
                         ),
                     )
+                    if not self._can_accept_call_response_from_node(node_id, session):
+                        raise RuntimeError(f"service replica response ignored for untrusted replica: {node_id}")
                     self._breaker_mark_success(node_id)
                     return node_id, resp
                 except Exception as exc:
                     last_error = exc
+                    if is_dependency_failure(exc):
+                        self._mark_method_node_blacklisted(method, node_id, exc)
                     failure_kind = classify_service_error(exc)
                     self._breaker_mark_failure(node_id, exc)
                     if not should_failover(
@@ -5100,28 +5409,30 @@ class Service(ServiceExecutionSession):
                     ):
                         raise RuntimeError(str(exc)) from exc
 
-        raise RuntimeError(f"call failed on all candidate nodes: {last_error}")
+        blacklist = self._method_blacklisted_nodes(method)
+        suffix = f"; dependency blacklist for method={method}: {blacklist}" if blacklist else ""
+        raise RuntimeError(f"call failed on all candidate nodes: {last_error}{suffix}")
 
     async def acall_all(
         self,
         method: str,
         payloads: Union[List[Dict[str, object]], Dict[str, object]],
         *,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 600.0,
         max_concurrency: int = 100,
     ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
-        """并发调用所有节点。
+        """骞跺彂璋冪敤鎵€鏈夎妭鐐广€?
 
-        将 payload 同时发送到所有可用节点，返回所有结果。
+        灏?payload 鍚屾椂鍙戦€佸埌鎵€鏈夊彲鐢ㄨ妭鐐癸紝杩斿洖鎵€鏈夌粨鏋溿€?
 
         Args:
-            method: 服务方法名
-            payloads: 可以是单个 payload（发送给所有节点）或 payload 列表（与节点一一对应）
-            timeout_sec: 单次调用超时时间
-            max_concurrency: 最大并发数
+            method: 鏈嶅姟鏂规硶鍚?
+            payloads: 鍙互鏄崟涓?payload锛堝彂閫佺粰鎵€鏈夎妭鐐癸級鎴?payload 鍒楄〃锛堜笌鑺傜偣涓€涓€瀵瑰簲锛?
+            timeout_sec: 鍗曟璋冪敤瓒呮椂鏃堕棿
+            max_concurrency: 鏈€澶у苟鍙戞暟
 
         Returns:
-            List[Tuple[节点ID, 响应, 异常]]：所有节点的结果列表
+            List[Tuple[鑺傜偣ID, 鍝嶅簲, 寮傚父]]锛氭墍鏈夎妭鐐圭殑缁撴灉鍒楄〃
         """
         if not self.sessions:
             raise RuntimeError("Service session has no active replicas")
@@ -5135,7 +5446,7 @@ class Service(ServiceExecutionSession):
         ]
         if not nodes:
             raise RuntimeError("Service session has no active replicas")
-        # 如果是单个 payload，复制给所有节点
+        # 濡傛灉鏄崟涓?payload锛屽鍒剁粰鎵€鏈夎妭鐐?
         if isinstance(payloads, dict):
             payloads = [dict(payloads) for _ in nodes]
         elif isinstance(payloads, list):
@@ -5253,7 +5564,7 @@ class Service(ServiceExecutionSession):
         return _CallProxy(
             method=name,
             group=self,
-            timeout_sec=60.0,
+            timeout_sec=600.0,
             strategy="predicted_busy",
             refresh_status=True,
         )
@@ -5302,7 +5613,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5329,7 +5640,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5354,7 +5665,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5380,7 +5691,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5406,7 +5717,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5430,7 +5741,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5455,7 +5766,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
@@ -5479,7 +5790,7 @@ class Service(ServiceExecutionSession):
         method: str,
         payloads: Sequence[Dict[str, object]],
         *,
-        timeout_sec: float = 30.0,
+        timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,

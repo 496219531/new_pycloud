@@ -77,7 +77,12 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[NodeCont
     return server, server.base_url, state
 
 
-def _gateway_route_variant(index: int, *, service_name: str = "svc-gateway-retry") -> InfoCenterServiceRoute:
+def _gateway_route_variant(
+    index: int,
+    *,
+    service_name: str = "svc-gateway-retry",
+    method_failures=None,
+) -> InfoCenterServiceRoute:
     return InfoCenterServiceRoute(
         service_name=service_name,
         service_id=f"svc-gw-{index}",
@@ -91,6 +96,7 @@ def _gateway_route_variant(index: int, *, service_name: str = "svc-gateway-retry
         in_flight=0,
         lease_expire_at=datetime.now(timezone.utc),
         http_base_url=f"http://127.0.0.1:{18080 + index}/svc/svc-gw-{index}",
+        method_failures=dict(method_failures or {}),
     )
 
 
@@ -314,10 +320,12 @@ class _SequenceRouteCache:
     def stop(self) -> None:
         return None
 
-    def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
+    def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False, method: str = ""):
         del service_name, force_refresh
         excluded = set(exclude_service_ids or ())
         for route in self.routes:
+            if str(method or "").strip() and str(method).strip() in dict(getattr(route, "method_failures", {}) or {}):
+                continue
             if route.service_id not in excluded:
                 return route
         raise RuntimeError("no available route")
@@ -325,6 +333,15 @@ class _SequenceRouteCache:
     def refresh(self, service_name: str, force: bool = False):
         self.refreshes.append((service_name, force))
         return list(self.routes)
+
+    def refresh_for_method(self, service_name: str, *, method: str):
+        self.refreshes.append((service_name, f"method:{method}"))
+        normalized_method = str(method or "").strip()
+        return [
+            route
+            for route in self.routes
+            if not normalized_method or normalized_method not in dict(getattr(route, "method_failures", {}) or {})
+        ]
 
     def mark_success(self, route) -> None:
         self.successes.append(route.service_id)
@@ -1203,6 +1220,42 @@ def test_gateway_route_cache_zero_alive_does_not_open_breaker():
         cache.stop()
 
 
+def test_gateway_route_cache_filters_method_failed_routes():
+    bad = _gateway_route_variant(
+        1,
+        service_name="svc-gateway-cache",
+        method_failures={"bad_func": {"reason": "missing dependency"}},
+    )
+    good = _gateway_route_variant(2, service_name="svc-gateway-cache")
+
+    class _StaticSource:
+        def __init__(self):
+            self.calls = []
+
+        def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int, method: str = ""):
+            self.calls.append((service_name, healthy_only, limit, method))
+            rows = [bad, good]
+            if method:
+                rows = [
+                    route
+                    for route in rows
+                    if method not in dict(getattr(route, "method_failures", {}) or {})
+                ]
+            return rows
+
+    source = _StaticSource()
+    cache = GatewayRouteCache(source=source, refresh_interval_sec=60.0)
+    try:
+        assert cache.select_route("svc-gateway-cache", method="bad_func").service_id == "svc-gw-2"
+        cache.mark_success(good)
+        good_func_routes = cache.refresh_for_method("svc-gateway-cache", method="good_func")
+        assert {route.service_id for route in good_func_routes} == {"svc-gw-1", "svc-gw-2"}
+        assert source.calls[0][3] == "bad_func"
+        assert source.calls[1][3] == "good_func"
+    finally:
+        cache.stop()
+
+
 def test_gateway_call_failover_tries_all_candidate_routes():
     routes = [_gateway_route_variant(i) for i in range(1, 5)]
     route_cache = _SequenceRouteCache(routes)
@@ -1234,6 +1287,35 @@ def test_gateway_call_failover_tries_all_candidate_routes():
     assert route_cache.observations[-1][1]["failed_route_count"] == 2
     assert route_cache.observations[-1][1]["last_failed_route_id"] == "svc-gw-2"
     assert route_cache.observations[-1][1]["selected_route_id"] == "svc-gw-3"
+
+
+def test_gateway_call_uses_method_specific_routes():
+    bad = _gateway_route_variant(
+        1,
+        service_name="svc-gateway-method",
+        method_failures={"bad_func": {"reason": "missing dependency"}},
+    )
+    good = _gateway_route_variant(2, service_name="svc-gateway-method")
+    route_cache = _SequenceRouteCache([bad, good])
+    app = GatewayHttpApp(route_cache=route_cache)
+    attempts = []
+
+    def _fake_invoke(self, route, *, method, payload, timeout_sec, service_token, serialization_mode=""):
+        del self, payload, timeout_sec, service_token, serialization_mode
+        attempts.append((route.service_id, method))
+        return {"ok": True, "data": {"route": route.service_id}}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(GatewayHttpApp, "_invoke_route", _fake_invoke)
+        code, body = app.handle_post(
+            path="/svc/svc-gateway-method/call/bad_func?timeout_sec=5.000",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"x": 1}).encode("utf-8"),
+        )
+
+    assert code == 200
+    assert body["data"]["route"] == "svc-gw-2"
+    assert attempts == [("svc-gw-2", "bad_func")]
 
 
 def test_gateway_stream_call_forwards_events_and_marks_success():
@@ -1268,6 +1350,37 @@ def test_gateway_stream_call_forwards_events_and_marks_success():
     assert [item[0] for item in attempts] == ["svc-gw-1"]
     assert route_cache.successes == ["svc-gw-1"]
     assert route_cache.failures == []
+
+
+def test_gateway_stream_call_uses_method_specific_routes():
+    bad = _gateway_route_variant(
+        1,
+        service_name="svc-gateway-stream-method",
+        method_failures={"bad_stream": {"reason": "missing dependency"}},
+    )
+    good = _gateway_route_variant(2, service_name="svc-gateway-stream-method")
+    route_cache = _SequenceRouteCache([bad, good])
+    app = GatewayHttpApp(route_cache=route_cache)
+    attempts = []
+
+    def _fake_stream(self, route, *, method, payload, timeout_sec, service_token, serialization_mode=""):
+        del self, payload, timeout_sec, service_token, serialization_mode
+        attempts.append((route.service_id, method))
+        yield {"event": "done", "ok": True}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(GatewayHttpApp, "_invoke_route_stream", _fake_stream)
+        handled = app.handle_post(
+            path="/svc/svc-gateway-stream-method/call/bad_stream?timeout_sec=5.000&stream=1",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({}).encode("utf-8"),
+        )
+
+    response = handled[0]
+    events = [json.loads(chunk.decode("utf-8")) for chunk in response.body_iter]
+    assert events == [{"event": "done", "ok": True}]
+    assert attempts == [("svc-gw-2", "bad_stream")]
+    assert route_cache.successes == ["svc-gw-2"]
 
 
 def test_gateway_call_user_error_does_not_failover():

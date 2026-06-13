@@ -948,6 +948,12 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
                 alive_workers=0,
                 stop_reason="ModuleNotFoundError: missing_pkg",
                 failure_at=failure_at,
+                method_failures={
+                    "calc": {
+                        "reason": "dependency runtime error method=calc missing_module=missing_pkg",
+                        "missing_module": "missing_pkg",
+                    }
+                },
             )
         },
         task_pools={
@@ -960,6 +966,12 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
                 worker_count=2,
                 failure_reason="executor host restart failed: missing_pkg",
                 failure_at=failure_at,
+                method_failures={
+                    "run": {
+                        "reason": "dependency runtime error method=run missing_module=pool_missing_pkg",
+                        "missing_module": "pool_missing_pkg",
+                    }
+                },
             )
         },
     )
@@ -970,6 +982,9 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
     assert "2026-06-01T07:30:00+00:00" in raw
     assert "ModuleNotFoundError: missing_pkg" in raw
     assert "executor host restart failed: missing_pkg" in raw
+    assert "dependency_modules" in raw
+    assert "calc: missing_module=missing_pkg" in raw
+    assert "run: missing_module=pool_missing_pkg" in raw
 
 
 def test_ops_page_separates_node_deploy_and_resource_health():
@@ -1467,6 +1482,175 @@ def test_startup_service_registration_ignores_stopped_duplicate_service_name():
     routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
 
     assert [route["service_id"] for route in routes] == ["svc-new"]
+
+
+def test_service_method_failure_blacklist_filters_only_matching_method_route():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-bad",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50061",
+        capacity=1,
+        queue_capacity=1,
+        services={
+            "svc-bad": NodeServiceState(
+                service_name="svc-method",
+                service_id="svc-bad",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                status_text="DEGRADED",
+                resource_health="degraded",
+                degraded=True,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-bad",
+                readiness="ready",
+                readiness_reason="method dependency failure: bad_func",
+                method_failures={
+                    "bad_func": {
+                        "reason": "dependency runtime error method=bad_func missing_module=missing_pkg",
+                    }
+                },
+            )
+        },
+    )
+    info_state.register_node_record(
+        node_instance_id="node-good",
+        node_id="node-good",
+        control_addr="127.0.0.1:50062",
+        capacity=1,
+        queue_capacity=1,
+        services={
+            "svc-good": NodeServiceState(
+                service_name="svc-method",
+                service_id="svc-good",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18082/svc/svc-good",
+                readiness="ready",
+            )
+        },
+    )
+
+    good_method_routes = info_state.list_service_routes(
+        service_name="svc-method",
+        healthy_only=True,
+        limit=10,
+        method="good_func",
+    )
+    bad_method_routes = info_state.list_service_routes(
+        service_name="svc-method",
+        healthy_only=True,
+        limit=10,
+        method="bad_func",
+    )
+
+    assert {route["service_id"] for route in good_method_routes} == {"svc-bad", "svc-good"}
+    assert {route["service_id"] for route in bad_method_routes} == {"svc-good"}
+
+
+def test_service_route_diagnosis_explains_method_failure_exclusion():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-bad",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50061",
+        capacity=1,
+        queue_capacity=1,
+        services={
+            "svc-bad": NodeServiceState(
+                service_name="svc-method",
+                service_id="svc-bad",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-bad",
+                readiness="ready",
+                resource_health="degraded",
+                readiness_reason="method dependency failure",
+                method_failures={
+                    "bad_func": {
+                        "category": "import_error",
+                        "reason": "missing_module=bad_pkg",
+                    }
+                },
+            )
+        },
+    )
+    info_state.register_node_record(
+        node_instance_id="node-good",
+        node_id="node-good",
+        control_addr="127.0.0.1:50062",
+        capacity=1,
+        queue_capacity=1,
+        services={
+            "svc-good": NodeServiceState(
+                service_name="svc-method",
+                service_id="svc-good",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18082/svc/svc-good",
+                readiness="ready",
+            )
+        },
+    )
+
+    diagnosis = info_state.diagnose_service_routes(
+        service_name="svc-method",
+        method="bad_func",
+        healthy_only=True,
+        limit=10,
+    )
+
+    by_service = {row["service_id"]: row for row in diagnosis["routes"]}
+    assert diagnosis["included_count"] == 1
+    assert diagnosis["excluded_count"] == 1
+    assert by_service["svc-good"]["included"] is True
+    assert by_service["svc-bad"]["included"] is False
+    assert by_service["svc-bad"]["excluded_reasons"][0]["code"] == "method_blocked"
+    assert by_service["svc-bad"]["excluded_reasons"][0]["method"] == "bad_func"
+    assert "missing_module=bad_pkg" in by_service["svc-bad"]["excluded_reasons"][0]["reason"]
+
+
+def test_infocenter_http_service_route_diagnosis_endpoint():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-bad",
+        node_id="node-bad",
+        control_addr="127.0.0.1:50061",
+        capacity=1,
+        queue_capacity=1,
+        services={
+            "svc-bad": NodeServiceState(
+                service_name="svc-method-http",
+                service_id="svc-bad",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                readiness="ready",
+                resource_health="degraded",
+                readiness_reason="method dependency failure",
+                method_failures={"bad_func": {"reason": "missing_module=bad_pkg"}},
+            )
+        },
+    )
+    server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    server.start()
+    try:
+        with InfoCenterClient(server.base_url, timeout_sec=2.0) as client:
+            diagnosis = client.diagnose_service_routes(
+                service_name="svc-method-http",
+                method="bad_func",
+                healthy_only=True,
+                limit=10,
+            )
+    finally:
+        server.stop()
+
+    assert diagnosis["excluded_count"] == 1
+    assert diagnosis["routes"][0]["included"] is False
+    assert diagnosis["routes"][0]["excluded_reasons"][0]["code"] == "method_blocked"
 
 
 def test_infocenter_replaces_existing_node_with_same_control_addr():

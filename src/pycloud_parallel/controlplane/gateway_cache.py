@@ -28,6 +28,7 @@ from pycloud_parallel.execution.scheduler import (
     SchedulerState,
     select_one_candidate,
 )
+from pycloud_parallel.execution.dependency_failover import dependency_method_blocked
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -146,6 +147,30 @@ class GatewayRouteCache:
             raise ValueError("service_name is required")
         return list(self._coalesced_refresh(name))
 
+    def refresh_for_method(self, service_name: str, *, method: str) -> Sequence[InfoCenterServiceRoute]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        normalized_method = str(method or "").strip()
+        try:
+            return list(
+                self._source.list_service_routes(
+                    service_name=name,
+                    healthy_only=True,
+                    limit=self.route_limit,
+                    method=normalized_method,
+                )
+            )
+        except TypeError:
+            rows = list(self.refresh(name, force=True))
+            if not normalized_method:
+                return rows
+            return [
+                route
+                for route in rows
+                if not dependency_method_blocked(getattr(route, "method_failures", {}), method=normalized_method)
+            ]
+
     def _coalesced_refresh(self, service_name: str) -> Sequence[InfoCenterServiceRoute]:
         name = str(service_name or "").strip()
         if not name:
@@ -217,9 +242,13 @@ class GatewayRouteCache:
         exclude_service_ids: Optional[Set[str]] = None,
         force_refresh: bool = False,
         strategy: str = "predicted_busy",
+        method: str = "",
     ) -> InfoCenterServiceRoute:
         name = str(service_name or "").strip()
-        if force_refresh:
+        normalized_method = str(method or "").strip()
+        if normalized_method:
+            routes = list(self.refresh_for_method(name, method=normalized_method))
+        elif force_refresh:
             routes = list(self.refresh(name, force=True))
         else:
             routes = list(self.get_routes(name))

@@ -72,6 +72,7 @@ def test_http_create_service_call_heartbeat_status_close(tmp_path):
                 service_token=session.service_token,
             ).accepted is True
             assert client.last_heartbeat_resource["alive_workers"] == session.worker_count
+            assert client.last_heartbeat_resource["method_failures"] == {}
             assert client.get_service_status(service_id=session.service_id).service_id == session.service_id
             assert client.end_service(
                 owner_client_id="owner-http",
@@ -196,6 +197,7 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
             assert struct_to_dict(result.result) == {"value": 8}
             assert pool.heartbeat().accepted is True
             assert client.last_heartbeat_resource["alive_workers"] == pool.worker_count
+            assert client.last_heartbeat_resource["method_failures"] == {}
             assert pool.get_status().pool_id == pool.pool_id
             assert pool.close().accepted is True
     finally:

@@ -17,6 +17,9 @@ from typing import Any, Deque, Dict, Optional, Tuple
 from pycloud_parallel.controlplane.executor_core import ExecutorCore
 
 
+DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC = 600.0
+
+
 def _simple_queue_get_if_ready(simple_queue, *, timeout: float = 0.0):
     reader = getattr(simple_queue, "_reader", None)
     if reader is not None:
@@ -354,6 +357,7 @@ class ExecutorHostClient:
         resp = self._request(
             "create_service",
             payload={"service_id": service_id, "worker_count": int(worker_count)},
+            timeout_sec=DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         )
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "create_service failed")))
@@ -403,6 +407,7 @@ class ExecutorHostClient:
         resp = self._request(
             "create_task_pool",
             payload={"pool_id": pool_id, "worker_count": int(worker_count)},
+            timeout_sec=DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         )
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "create_task_pool failed")))
@@ -422,7 +427,7 @@ class ExecutorHostClient:
         action: str,
         *,
         payload: Dict[str, Any],
-        timeout_sec: float = 30.0,
+        timeout_sec: float = DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         raise_on_error: bool = True,
     ) -> Dict[str, Any]:
         resp = self._request(action, payload=payload, timeout_sec=timeout_sec)
@@ -430,7 +435,7 @@ class ExecutorHostClient:
             raise RuntimeError(str(resp.get("error", f"{action} failed")))
         return resp
 
-    def prepare_artifact(self, *, artifact_spec: Dict[str, Any], timeout_sec: float = 30.0) -> Dict[str, Any]:
+    def prepare_artifact(self, *, artifact_spec: Dict[str, Any], timeout_sec: float = DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC) -> Dict[str, Any]:
         return self._request_action(
             "prepare_artifact",
             payload=dict(artifact_spec),
@@ -461,7 +466,7 @@ class ExecutorHostClient:
         resp = self._request_action(
             action,
             payload={**dict(identity), "fanout": int(fanout), **dict(execute_spec)},
-            timeout_sec=max(1.0, float(fanout) + 5.0),
+            timeout_sec=DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC,
         )
         return int(resp.get("submitted", 0) or 0)
 

@@ -124,6 +124,21 @@ class _DiscoveryRouteCache:
                     self._local_inflight.pop(key, None)
         return rows
 
+    def refresh_for_method(self, service_name: str, *, method: str) -> Sequence[object]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        normalized_method = str(method or "").strip()
+        with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
+            return list(
+                client.list_service_routes(
+                    service_name=name,
+                    healthy_only=True,
+                    limit=self.route_limit,
+                    method=normalized_method,
+                )
+            )
+
     def get_routes(self, service_name: str) -> Sequence[object]:
         name = str(service_name or "").strip()
         if not name:
@@ -181,9 +196,14 @@ class _DiscoveryRouteCache:
         exclude_service_ids: Optional[Set[str]] = None,
         force_refresh: bool = False,
         strategy: str = "predicted_busy",
+        method: str = "",
     ):
         name = str(service_name or "").strip()
-        routes = list(self.refresh(name, force=True)) if force_refresh else list(self.get_routes(name))
+        normalized_method = str(method or "").strip()
+        if normalized_method:
+            routes = list(self.refresh_for_method(name, method=normalized_method))
+        else:
+            routes = list(self.refresh(name, force=True)) if force_refresh else list(self.get_routes(name))
         excluded = exclude_service_ids or set()
         candidates = [
             route

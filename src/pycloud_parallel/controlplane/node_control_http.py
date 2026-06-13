@@ -71,6 +71,8 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
+DEFAULT_CONTROL_OPERATION_TIMEOUT_SEC = 600.0
+UPDATE_GLOBALS_TIMEOUT_SEC = 600.0
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -801,6 +803,7 @@ class NodeControlHttpApp:
                 "readiness": str(getattr(pool, "readiness", "") or ""),
                 "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
                 "create_stage": str(getattr(pool, "create_stage", "") or ""),
+                "method_failures": dict(getattr(pool, "method_failures", {}) or {}),
                 "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
                 "resource_epoch": 0,
                 "status": str(pool.status or ""),
@@ -1035,6 +1038,7 @@ class NodeControlHttpApp:
                 "readiness": str(getattr(session, "readiness", "") or ""),
                 "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
                 "create_stage": str(getattr(session, "create_stage", "") or ""),
+                "method_failures": dict(getattr(session, "method_failures", {}) or {}),
                 "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
                 "resource_epoch": 0,
             }
@@ -1218,7 +1222,7 @@ class NodeControlHttpServer:
 
 
 class HttpNodeControlClient:
-    def __init__(self, target: str, *, timeout_sec: float = 10.0, api_token: str = "") -> None:
+    def __init__(self, target: str, *, timeout_sec: float = DEFAULT_CONTROL_OPERATION_TIMEOUT_SEC, api_token: str = "") -> None:
         self.base_url = target_to_base_url(target)
         self.target = self.base_url
         self.control_addr = self.base_url
@@ -1445,6 +1449,7 @@ class HttpNodeControlClient:
         expected_node_instance_id: str = "",
         create_request_id: str = "",
         wait_ready: bool = True,
+        timeout_sec: float = DEFAULT_CONTROL_OPERATION_TIMEOUT_SEC,
     ) -> NativeTaskPoolClient:
         import hashlib
 
@@ -1500,6 +1505,7 @@ class HttpNodeControlClient:
             "/taskpools",
             payload,
             headers=self._api_headers(api_token),
+            timeout_sec=timeout_sec,
         )
         now = utc_now()
         return NativeTaskPoolClient(
@@ -1549,6 +1555,7 @@ class HttpNodeControlClient:
         expected_node_instance_id: str = "",
         create_request_id: str = "",
         wait_ready: bool = True,
+        timeout_sec: float = DEFAULT_CONTROL_OPERATION_TIMEOUT_SEC,
     ) -> ServiceSessionClient:
         import hashlib
 
@@ -1607,6 +1614,7 @@ class HttpNodeControlClient:
             "/services",
             payload,
             headers=self._api_headers(api_token),
+            timeout_sec=timeout_sec,
         )
         now = utc_now()
         return ServiceSessionClient(
@@ -1714,7 +1722,14 @@ class HttpNodeControlClient:
             {"owner_client_id": owner_client_id, "pool_token": pool_token, "seq": int(seq)},
             timeout_sec=timeout_sec,
         )
-        self.last_heartbeat_resource = {"alive_workers": max(0, int(data.get("alive_workers", 0) or 0))}
+        self.last_heartbeat_resource = {
+            "alive_workers": max(0, int(data.get("alive_workers", 0) or 0)),
+            "method_failures": dict(data.get("method_failures") or {}),
+            "readiness": str(data.get("readiness", "") or ""),
+            "readiness_reason": str(data.get("readiness_reason", "") or ""),
+            "create_stage": str(data.get("create_stage", "") or ""),
+            "status": str(data.get("status", "") or ""),
+        }
         return _parse_message(pb2.HeartbeatTaskPoolResponse, data)
 
     def cancel_pool_job(self, *, pool_id: str, pool_token: str, job_id: str, reason: str = "") -> pb2.CancelJobResponse:
@@ -1731,6 +1746,7 @@ class HttpNodeControlClient:
         prepared_keys: Sequence[str],
         values: Optional[object] = None,
         transport_values: Optional[pb2.TransportPayload] = None,
+        timeout_sec: float = UPDATE_GLOBALS_TIMEOUT_SEC,
     ) -> pb2.UpdateRuntimeGlobalsResponse:
         del prepared_keys
         payload: Dict[str, object] = {
@@ -1741,13 +1757,19 @@ class HttpNodeControlClient:
         }
         if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
             payload["transport_values"] = _transport_payload_meta(transport_values)
-            data = self._binary_json("POST", "/runtime-globals-bytes", payload, [bytes(transport_values.payload or b"")])
+            data = self._binary_json(
+                "POST",
+                "/runtime-globals-bytes",
+                payload,
+                [bytes(transport_values.payload or b"")],
+                timeout_sec=timeout_sec,
+            )
             return _parse_message(pb2.UpdateRuntimeGlobalsResponse, data)
         elif values is not None:
             payload["values"] = _message_to_dict(values)
         else:
             payload["values"] = {}
-        data = self._json("POST", "/runtime-globals", payload)
+        data = self._json("POST", "/runtime-globals", payload, timeout_sec=timeout_sec)
         return _parse_message(pb2.UpdateRuntimeGlobalsResponse, data)
 
     def update_runtime_globals_prepared(
@@ -1760,6 +1782,7 @@ class HttpNodeControlClient:
         prepared_values: Dict[str, object],
         serialization_mode: str = "",
         effective_policy=None,
+        timeout_sec: float = UPDATE_GLOBALS_TIMEOUT_SEC,
     ) -> pb2.UpdateRuntimeGlobalsResponse:
         limit_bytes = int(getattr(effective_policy, "inline_payload_hard_limit_bytes", 0) or 0) if effective_policy is not None else 0
         effective_mode = resolve_effective_serialization_mode(request_mode=serialization_mode, context="taskpool_session")
@@ -1776,6 +1799,7 @@ class HttpNodeControlClient:
             code_token=code_token,
             prepared_keys=sorted(str(key) for key in prepared_values.keys()),
             transport_values=transport_values,
+            timeout_sec=timeout_sec,
         )
 
     def get_task_pool_status(self, *, pool_id: str, pool_token: str) -> pb2.TaskPoolStatusInfo:
@@ -1799,7 +1823,7 @@ class HttpNodeControlClient:
         service_id: str,
         method: str,
         payload: Dict[str, object],
-        timeout_sec: float = 60.0,
+        timeout_sec: float = DEFAULT_CONTROL_OPERATION_TIMEOUT_SEC,
         service_token: str = "",
         serialization_mode: str = "",
         effective_policy=None,
@@ -1821,13 +1845,24 @@ class HttpNodeControlClient:
             data=dict_to_struct(data.get("data", {}), mode=effective_mode),
         )
 
-    def update_service_globals(self, *, owner_client_id: str, service_id: str, service_token: str, values: Dict[str, object], serialization_mode: str = "", effective_policy=None):
+    def update_service_globals(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        values: Dict[str, object],
+        serialization_mode: str = "",
+        effective_policy=None,
+        timeout_sec: float = UPDATE_GLOBALS_TIMEOUT_SEC,
+    ):
         effective_mode = resolve_effective_serialization_mode(request_mode=serialization_mode, context="service_owner")
         encoded_values = encode_payload_for_transport(values or {}, policy=get_payload_policy("managed_globals"), context="service_owner", mode=effective_mode)
         data = self._json(
             "POST",
             f"/services/{quote(str(service_id), safe='')}/globals",
             {"owner_client_id": owner_client_id, "service_token": service_token, "serialization_mode": effective_mode, "values": encoded_values},
+            timeout_sec=timeout_sec,
         )
         return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
 
@@ -1840,6 +1875,7 @@ class HttpNodeControlClient:
         prepared_keys: Sequence[str],
         values: Optional[object] = None,
         transport_values: Optional[pb2.TransportPayload] = None,
+        timeout_sec: float = UPDATE_GLOBALS_TIMEOUT_SEC,
     ) -> pb2.UpdateServiceGlobalsResponse:
         del prepared_keys
         payload: Dict[str, object] = {
@@ -1853,6 +1889,7 @@ class HttpNodeControlClient:
                 f"/services/{quote(str(service_id), safe='')}/globals-bytes",
                 payload,
                 [bytes(transport_values.payload or b"")],
+                timeout_sec=timeout_sec,
             )
             return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
         elif values is not None:
@@ -1867,6 +1904,7 @@ class HttpNodeControlClient:
             "POST",
             f"/services/{quote(str(service_id), safe='')}/globals",
             payload,
+            timeout_sec=timeout_sec,
         )
         return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
 
@@ -1879,6 +1917,7 @@ class HttpNodeControlClient:
         prepared_values: Dict[str, object],
         serialization_mode: str = "",
         effective_policy=None,
+        timeout_sec: float = UPDATE_GLOBALS_TIMEOUT_SEC,
     ) -> pb2.UpdateServiceGlobalsResponse:
         limit_bytes = int(getattr(effective_policy, "inline_payload_hard_limit_bytes", 0) or 0) if effective_policy is not None else 0
         effective_mode = resolve_effective_serialization_mode(request_mode=serialization_mode, context="service_owner")
@@ -1894,6 +1933,7 @@ class HttpNodeControlClient:
             service_token=service_token,
             prepared_keys=sorted(str(key) for key in prepared_values.keys()),
             transport_values=transport_values,
+            timeout_sec=timeout_sec,
         )
 
     def heartbeat_service(
@@ -1911,7 +1951,14 @@ class HttpNodeControlClient:
             {"owner_client_id": owner_client_id, "service_token": service_token, "seq": int(seq)},
             timeout_sec=timeout_sec,
         )
-        self.last_heartbeat_resource = {"alive_workers": max(0, int(data.get("alive_workers", 0) or 0))}
+        self.last_heartbeat_resource = {
+            "alive_workers": max(0, int(data.get("alive_workers", 0) or 0)),
+            "method_failures": dict(data.get("method_failures") or {}),
+            "readiness": str(data.get("readiness", "") or ""),
+            "readiness_reason": str(data.get("readiness_reason", "") or ""),
+            "create_stage": str(data.get("create_stage", "") or ""),
+            "status": int(data.get("status", 0) or 0),
+        }
         return _parse_message(pb2.HeartbeatServiceResponse, data)
 
     def end_service(self, *, owner_client_id: str, service_id: str, service_token: str, reason: str = "") -> pb2.EndServiceResponse:
