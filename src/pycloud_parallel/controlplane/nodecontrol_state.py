@@ -247,6 +247,17 @@ def _refresh_resource_lease(resource: object, *, now: datetime) -> None:
     resource.lease_expire_at = now + timedelta(seconds=max(1, int(getattr(resource, "heartbeat_timeout_sec", 0) or 0)))
 
 
+def _is_resource_create_in_progress(resource: object) -> bool:
+    stage = str(getattr(resource, "create_stage", "") or "").strip().lower()
+    readiness = str(getattr(resource, "readiness", "") or "").strip().lower()
+    return stage in {
+        "accepted",
+        "artifact_prepare",
+        "executor_create",
+        "globals_warmup",
+    } or readiness == "initializing"
+
+
 class NodeControlState(NodeRuntimeBase):
     """NodeControl 状态管理。
 
@@ -3647,6 +3658,7 @@ class NodeControlState(NodeRuntimeBase):
                     current = self._services.get(service.service_id)
                     if current is None:
                         raise RuntimeError("service create cancelled")
+                    ready_at = utc_now()
                     current.status = pb2.SERVICE_STATUS_RUNNING
                     current.executor_ready = True
                     current.alive_workers = actual_workers
@@ -3655,6 +3667,7 @@ class NodeControlState(NodeRuntimeBase):
                     current.create_stage = "ready"
                     current.stop_reason = ""
                     current.failure_at = None
+                    _refresh_resource_lease(current, now=ready_at)
                     self._publish_resource_progress_locked(
                         resource_kind="service",
                         resource_id=service.service_id,
@@ -3880,6 +3893,7 @@ class NodeControlState(NodeRuntimeBase):
                     current = self._task_pools.get(pool.pool_id)
                     if current is None:
                         raise RuntimeError("task pool create cancelled")
+                    ready_at = utc_now()
                     current.status = "RUNNING"
                     current.executor_ready = True
                     current.alive_workers = actual_workers
@@ -3888,6 +3902,7 @@ class NodeControlState(NodeRuntimeBase):
                     current.create_stage = "ready"
                     current.stop_reason = ""
                     current.failure_at = None
+                    _refresh_resource_lease(current, now=ready_at)
                     self._record_task_pool_lifecycle_timing_locked(
                         current,
                         metric="executor_create",
@@ -6087,6 +6102,9 @@ class NodeControlState(NodeRuntimeBase):
         # resources only when the owner heartbeat lease expires; the owner applies the
         # zero-alive 100s disconnect/blacklist/compensation policy.
         if not bool(getattr(session, "node_managed", False)) and now > session.lease_expire_at:
+            if _is_resource_create_in_progress(session):
+                _refresh_resource_lease(session, now=now)
+                return
             self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
             return
 
@@ -6100,6 +6118,9 @@ class NodeControlState(NodeRuntimeBase):
         # Same boundary as Service: zero worker liveness is reported upward; local
         # cleanup is driven by the owner heartbeat lease, not by telemetry alone.
         if now > pool.lease_expire_at:
+            if _is_resource_create_in_progress(pool):
+                _refresh_resource_lease(pool, now=now)
+                return
             self._stop_task_pool_resource_locked(
                 pool,
                 reason=_resource_stop_reason("owner heartbeat timeout"),

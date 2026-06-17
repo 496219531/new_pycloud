@@ -66,6 +66,16 @@ def _build_service_entry_module_with_resource(tmp_path, monkeypatch):
     return worker_module
 
 
+def _fake_service_heartbeat_response(service_id: str = "") -> SimpleNamespace:
+    return SimpleNamespace(
+        ok=True,
+        accepted=True,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        next_heartbeat_in_sec=15,
+        service_id=service_id,
+    )
+
+
 def test_service_route_summary_reports_fixed_routes():
     node = InfoCenterNode(
         node_instance_id="node-inst-1",
@@ -1379,14 +1389,14 @@ def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 failed=True,
-                last_error="RuntimeError('heartbeat failed: timed out')",
+                last_error="RuntimeError('service executor host missing')",
             )
         },
         nodes={"node-inst-1": node_1},
         _clients={"node-inst-1": old_client},
     )
     group._active_replica_ids.discard("node-inst-1")  # noqa: SLF001
-    group.failures["node-inst-1"] = "RuntimeError('heartbeat failed: timed out')"
+    group.failures["node-inst-1"] = "RuntimeError('service executor host missing')"
     group._configure_dynamic_compensation(  # noqa: SLF001
         {
             "infocenter_target": "127.0.0.1:50051",
@@ -2013,6 +2023,9 @@ def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_p
                 status=pb2.SERVICE_STATUS_RUNNING,
             )
 
+        def heartbeat_service(self, **kwargs):
+            return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
         def close(self) -> None:
             return None
 
@@ -2047,7 +2060,7 @@ def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_p
 
     try:
         assert started == ["127.0.0.1:50061", "127.0.0.1:50062"]
-        assert group.node_instance_ids() == ["node-1", "node-2"]
+        assert sorted(group.node_instance_ids()) == ["node-1", "node-2"]
     finally:
         group.close(end_services=False)
 
@@ -4594,6 +4607,226 @@ class TestOwnerServiceFacade:
         for client in group._clients.values():  # noqa: SLF001
             client.close()
 
+    def test_deploy_heartbeats_fast_replica_while_other_create_is_still_running(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        node_a = SimpleNamespace(
+            node_id="node-a",
+            node_instance_id="node-a-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        node_b = SimpleNamespace(
+            node_id="node-b",
+            node_instance_id="node-b-inst",
+            control_addr="127.0.0.1:50062",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        slow_create_started = threading.Event()
+        release_slow_create = threading.Event()
+        fast_heartbeat_before_slow_release = threading.Event()
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **_kwargs):
+                if self.target.endswith(":50062"):
+                    slow_create_started.set()
+                    assert release_slow_create.wait(timeout=5.0)
+                suffix = self.target.rsplit(":", 1)[-1]
+                from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+
+                return ServiceSessionClient(
+                    _client=self,
+                    owner_client_id=_kwargs.get("owner_client_id", ""),
+                    service_id=f"svc-{suffix}",
+                    service_token=f"token-{suffix}",
+                    code_version="sha256:test",
+                    http_base_url=f"http://{self.target}/svc/svc-{suffix}",
+                    heartbeat_timeout_sec=max(1, int(_kwargs.get("heartbeat_timeout_sec", 30) or 30)),
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def heartbeat_service(self, **kwargs):
+                if kwargs.get("service_id") == "svc-50061" and slow_create_started.is_set() and not release_slow_create.is_set():
+                    fast_heartbeat_before_slow_release.set()
+                return SimpleNamespace(
+                    ok=True,
+                    accepted=True,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                    service_id=kwargs.get("service_id", ""),
+                )
+
+            def close(self) -> None:
+                return None
+
+        try:
+            with patch(
+                "pycloud_parallel.execution.service_session._retry_infocenter_request",
+                return_value=((), [node_a, node_b]),
+            ), patch(
+                "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+                _FakeNodeControlClient,
+            ), patch.object(
+                Service,
+                "_persist_session_cache",
+                lambda self: None,
+            ):
+                result_holder = {}
+                error_holder = {}
+
+                def _deploy():
+                    try:
+                        result_holder["group"] = Service._deploy_from_infocenter(
+                            infocenter_target="127.0.0.1:50051",
+                            owner_client_id="owner-demo",
+                            service_name="demo-slow-create",
+                            source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                            entry_module="demo_service",
+                            entry_callable="run",
+                            node_count=2,
+                            min_success_nodes=2,
+                            heartbeat_timeout_sec=1,
+                            session_cache_dir=str(tmp_path),
+                        )
+                    except Exception as exc:  # pragma: no cover - surfaced below
+                        error_holder["error"] = exc
+
+                thread = threading.Thread(target=_deploy)
+                thread.start()
+                assert slow_create_started.wait(timeout=2.0)
+                assert fast_heartbeat_before_slow_release.wait(timeout=3.0)
+                release_slow_create.set()
+                thread.join(timeout=3.0)
+                assert not thread.is_alive()
+                assert error_holder == {}
+                group = result_holder["group"]
+        finally:
+            release_slow_create.set()
+
+        try:
+            assert sorted(group.sessions) == ["node-a-inst", "node-b-inst"]
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
+    def test_deploy_create_with_terminal_initial_heartbeat_does_not_count_as_success(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        ended = []
+        closed = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.closed = False
+
+            def create_service_from_bytes(self, **_kwargs):
+                from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+
+                return ServiceSessionClient(
+                    _client=self,
+                    owner_client_id=_kwargs.get("owner_client_id", ""),
+                    service_id="svc-stopped",
+                    service_token="token-stopped",
+                    code_version="sha256:test",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-stopped",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def heartbeat_service(self, **_kwargs):
+                raise RuntimeError("service is stopped")
+
+            def end_service(self, **kwargs):
+                ended.append(dict(kwargs))
+                return SimpleNamespace(status=pb2.SERVICE_STATUS_STOPPED)
+
+            def close(self) -> None:
+                self.closed = True
+                closed.append(self.target)
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=((), [node]),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            with pytest.raises(RuntimeError, match="success nodes=0"):
+                Service._deploy_from_infocenter(
+                    infocenter_target="127.0.0.1:50051",
+                    owner_client_id="owner-demo",
+                    service_name="demo-terminal-heartbeat",
+                    source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                    entry_module="demo_service",
+                    entry_callable="run",
+                    min_success_nodes=1,
+                    session_cache_dir=str(tmp_path),
+                )
+
+        assert [item["service_id"] for item in ended] == ["svc-stopped"]
+        assert closed == []
+
+    def test_deploying_service_does_not_submit_compensation(self):
+        from pycloud_parallel.execution.service_session import Service
+
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-deploying",
+            sessions={},
+            nodes={},
+            _deploying=True,
+        )
+
+        with patch.object(group, "_submit_compensation_attempt") as mocked_submit:
+            submitted = group._maybe_submit_compensation_after_tick(  # noqa: SLF001
+                {"node_count": 1},
+                resource_name="demo-deploying",
+            )
+
+        assert submitted is False
+        mocked_submit.assert_not_called()
+
     def test_deploy_same_code_without_token_cache_redeploys_fresh(self, tmp_path, capsys):
         from datetime import datetime, timezone, timedelta
 
@@ -4881,6 +5114,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -4964,6 +5200,9 @@ class TestOwnerServiceFacade:
                     worker_count=1,
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
+
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
 
             def close(self) -> None:
                 return None
@@ -5055,6 +5294,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -5129,6 +5371,9 @@ class TestOwnerServiceFacade:
                     worker_count=1,
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
+
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
 
             def close(self) -> None:
                 return None
@@ -5236,6 +5481,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -5331,6 +5579,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -5403,6 +5654,15 @@ class TestOwnerServiceFacade:
                     heartbeat_timeout_sec=30,
                     worker_count=1,
                     status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def heartbeat_service(self, **kwargs):
+                return SimpleNamespace(
+                    ok=True,
+                    accepted=True,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                    service_id=kwargs.get("service_id", ""),
                 )
 
             def close(self) -> None:
@@ -5480,6 +5740,15 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return SimpleNamespace(
+                    ok=True,
+                    accepted=True,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                    service_id=kwargs.get("service_id", ""),
+                )
+
             def close(self) -> None:
                 return None
 
@@ -5549,6 +5818,9 @@ class TestOwnerServiceFacade:
                     worker_count=1,
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
+
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
 
             def close(self) -> None:
                 return None
@@ -6890,6 +7162,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -6985,6 +7260,15 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return SimpleNamespace(
+                    ok=True,
+                    accepted=True,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                    service_id=kwargs.get("service_id", ""),
+                )
+
             def close(self) -> None:
                 return None
 
@@ -7077,8 +7361,15 @@ class TestOwnerServiceFacade:
                 self.timeout_sec = timeout_sec
 
             def heartbeat_service(self, **kwargs):
-                del kwargs
-                raise RuntimeError("service is stopped")
+                if kwargs.get("service_id") == "svc-old":
+                    raise RuntimeError("service is stopped")
+                return SimpleNamespace(
+                    ok=True,
+                    accepted=True,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                    service_id=kwargs.get("service_id", ""),
+                )
 
             def create_service_from_bytes(self, **kwargs):
                 create_calls.append(dict(kwargs))
@@ -7369,6 +7660,9 @@ class TestOwnerServiceFacade:
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
 
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
+
             def close(self) -> None:
                 return None
 
@@ -7475,6 +7769,9 @@ class TestOwnerServiceFacade:
                     worker_count=1,
                     status=pb2.SERVICE_STATUS_RUNNING,
                 )
+
+            def heartbeat_service(self, **kwargs):
+                return _fake_service_heartbeat_response(kwargs.get("service_id", ""))
 
             def close(self) -> None:
                 return None

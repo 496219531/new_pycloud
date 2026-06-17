@@ -839,6 +839,8 @@ class ExecutionSessionBase:
             return True
 
     def _maybe_submit_compensation_after_tick(self, spec: Optional[Dict[str, Any]], *, resource_name: str = "") -> bool:
+        if bool(getattr(self, "_deploying", False)):
+            return False
         if not spec:
             return False
         desired = max(0, int(dict(spec).get("node_count", 0) or 0))

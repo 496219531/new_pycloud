@@ -566,6 +566,69 @@ def test_nodecontrol_service_create_wait_ready_false_returns_before_put_code(tmp
         state.close()
 
 
+def test_nodecontrol_service_async_create_lease_starts_when_ready(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-ready-lease",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_ready_lease"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=45)
+    current_time = {"value": t0}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            current_time["value"] = t1
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-async-ready-lease",
+            service_name="svc-async-ready-lease",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_ready_lease",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-ready-lease-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="service", resource_id=session.service_id)["readiness"] == "ready",
+            timeout_sec=3.0,
+        )
+        ready = state.get_service(session.service_id)
+        assert ready.created_at == t0
+        assert ready.last_heartbeat_at == t1
+        assert ready.lease_expire_at == t1 + timedelta(seconds=30)
+    finally:
+        state.close()
+
+
 def test_nodecontrol_task_pool_create_signals_and_heartbeat_stays_lightweight(tmp_path):
     state = NodeControlState(
         node_id="node-pool-signals",
@@ -677,6 +740,68 @@ def test_nodecontrol_sync_task_pool_create_lease_starts_when_ready(tmp_path, mon
         assert pool.created_at == t0
         assert pool.last_heartbeat_at == t1
         assert pool.lease_expire_at == t1 + timedelta(seconds=30)
+    finally:
+        state.close()
+
+
+def test_nodecontrol_task_pool_async_create_lease_starts_when_ready(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-async-ready-lease",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_async_ready_lease"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=45)
+    current_time = {"value": t0}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            current_time["value"] = t1
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-async-ready-lease",
+            pool_name="pool-async-ready-lease",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async_ready_lease",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="pool-async-ready-lease-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)["readiness"] == "ready",
+            timeout_sec=3.0,
+        )
+        ready = state.get_task_pool_status(pool.pool_id)
+        assert ready.created_at == t0
+        assert ready.last_heartbeat_at == t1
+        assert ready.lease_expire_at == t1 + timedelta(seconds=30)
     finally:
         state.close()
 
@@ -6515,6 +6640,122 @@ def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tm
         assert code == 409
         assert body["error"] == "owner heartbeat timeout"
         assert body["stop_reason"] == "owner heartbeat timeout"
+    finally:
+        state.close()
+
+
+def test_service_create_in_progress_is_not_stopped_by_owner_heartbeat_timeout(tmp_path):
+    state = NodeControlState(
+        node_id="node-create-timeout-grace",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_create_timeout_grace"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    now = utc_now()
+    stop_calls = []
+
+    class _FakeExecutorHost:
+        def resource_worker_liveness(self):
+            return {}
+
+        def stop_service(self, **kwargs):
+            stop_calls.append(("stop_service", kwargs))
+
+        def close(self, **_kwargs):
+            return None
+
+    creating = ServiceSession(
+        service_id="svc-creating",
+        owner_client_id="owner",
+        service_name="svc-creating",
+        code_version="sha256:creating",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-creating",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now - timedelta(minutes=2),
+        last_heartbeat_at=now - timedelta(minutes=2),
+        lease_expire_at=now - timedelta(seconds=1),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+        readiness="initializing",
+        create_stage="globals_warmup",
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[creating.service_id] = creating  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert creating.status == pb2.SERVICE_STATUS_RUNNING
+        assert creating.stop_reason == ""
+        assert creating.lease_expire_at > now
+        assert stop_calls == []
+    finally:
+        state.close()
+
+
+def test_task_pool_create_in_progress_is_not_stopped_by_owner_heartbeat_timeout(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-create-timeout-grace",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_timeout_grace"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    now = utc_now()
+    stop_calls = []
+
+    class _FakeExecutorHost:
+        def resource_worker_liveness(self):
+            return {}
+
+        def stop_task_pool(self, **kwargs):
+            stop_calls.append(("stop_task_pool", kwargs))
+
+        def close(self, **_kwargs):
+            return None
+
+    creating = TaskPoolState(
+        pool_id="pool-creating",
+        owner_client_id="owner",
+        pool_name="pool-creating",
+        code_version="sha256:creating",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now - timedelta(minutes=2),
+        last_heartbeat_at=now - timedelta(minutes=2),
+        lease_expire_at=now - timedelta(seconds=1),
+        executor_ready=True,
+        alive_workers=1,
+        readiness="initializing",
+        create_stage="globals_warmup",
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[creating.pool_id] = creating  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert creating.status == "RUNNING"
+        assert creating.stop_reason == ""
+        assert creating.lease_expire_at > now
+        assert stop_calls == []
     finally:
         state.close()
 

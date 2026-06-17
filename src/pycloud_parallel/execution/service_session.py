@@ -87,6 +87,7 @@ from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     format_replica_create_failure,
+    iter_create_requests_completed,
     is_permanent_replica_create_failure,
     normalize_initial_globals,
     prepare_deployment_artifact,
@@ -2106,6 +2107,7 @@ class Service(ServiceExecutionSession):
     _pending_globals_values: Optional[Dict[str, object]] = field(default=None, repr=False)
     _pending_globals_reason: str = field(default="", repr=False)
     _keepalive_retry_forever: bool = field(default=False, repr=False)
+    _deploying: bool = field(default=False, repr=False)
     serialization_mode: str = ""
     policy_id: InitVar[str] = ""
     _policy_id: str = field(default="", repr=False)
@@ -2221,6 +2223,70 @@ class Service(ServiceExecutionSession):
             return
         self._compensation_spec = dict(spec)
         self._keepalive_retry_forever = True
+
+    def _attach_created_replica(
+        self,
+        node_key: str,
+        node: InfoCenterNode,
+        client: Any,
+        session: ServiceSessionClient,
+        *,
+        source: str = "deploy",
+    ) -> bool:
+        normalized = str(node_key or "").strip()
+        if not normalized or client is None or session is None:
+            return False
+        try:
+            heartbeat = getattr(session, "heartbeat", None)
+            if callable(heartbeat):
+                heartbeat()
+            else:
+                client.heartbeat_service(
+                    owner_client_id=self.owner_client_id,
+                    service_id=session.service_id,
+                    service_token=session.service_token,
+                    seq=0,
+                )
+                now_dt = datetime.now(timezone.utc)
+                with contextlib.suppress(Exception):
+                    session.last_heartbeat_at = now_dt
+                    session.lease_expire_at = now_dt + timedelta(
+                        seconds=max(1, int(getattr(session, "heartbeat_timeout_sec", 0) or 0))
+                    )
+        except Exception as exc:
+            category = classify_error(exc, resource_kind="service")
+            with self._route_lock:
+                self.failures[normalized] = repr(exc)
+            if category != ErrorCategory.SERVICE_TERMINAL:
+                self._mark_retry_probe_replica(normalized)
+            with contextlib.suppress(Exception):
+                closer = getattr(session, "close", None)
+                if callable(closer):
+                    closer(reason=f"{source} attach heartbeat failed")
+                else:
+                    client.close()
+            logger.warning(
+                "service %s attach heartbeat failed service_name=%s node_instance_id=%s category=%s err=%r",
+                source,
+                self.service_name,
+                normalized,
+                category.value,
+                exc,
+            )
+            return False
+        with self._route_lock:
+            old_client = self._clients.pop(normalized, None)
+            if old_client is not None and old_client is not client:
+                with contextlib.suppress(Exception):
+                    old_client.close()
+            self.sessions[normalized] = session
+            self._clients[normalized] = client
+            self.nodes[normalized] = node
+            self.failures.pop(normalized, None)
+            self._breaker_states.setdefault(normalized, CandidateBreakerState())
+            self._mark_replica_heartbeat_success(normalized, session, allow_new=True)
+        self._wake_keepalive()
+        return True
 
     @staticmethod
     def _is_retryable_compensation_failure(message: str) -> bool:
@@ -3390,8 +3456,11 @@ class Service(ServiceExecutionSession):
         def _discover_from_infocenter() -> Tuple[Sequence[InfoCenterServiceRoute], Sequence[InfoCenterNode]]:
             with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
                 existing_routes: Sequence[InfoCenterServiceRoute] = ()
+                routes_sec = 0.0
+                nodes_sec = 0.0
                 if ensure_unique_service_name:
                     list_routes = getattr(infocenter, "list_service_routes_for_exclusive_check", None)
+                    routes_started_at = time.perf_counter()
                     if callable(list_routes):
                         existing_routes = list_routes(
                             service_name=effective_service_name,
@@ -3403,11 +3472,21 @@ class Service(ServiceExecutionSession):
                             healthy_only=True,
                             limit=max(100, discovery_limit * 10),
                         )
+                    routes_sec = time.perf_counter() - routes_started_at
+                nodes_started_at = time.perf_counter()
                 discovered_nodes = infocenter.list_nodes(
                     healthy_only=healthy_only,
                     tags=tags,
                     limit=discovery_limit,
                 )
+                nodes_sec = time.perf_counter() - nodes_started_at
+                if routes_sec >= 1.0 or nodes_sec >= 1.0:
+                    _emit_owner_notice(
+                        "deploy discovery slow "
+                        f"service_name={effective_service_name} target={infocenter_target} "
+                        f"routes_sec={routes_sec:.3f} nodes_sec={nodes_sec:.3f} "
+                        f"existing_routes={len(existing_routes)} discovered_nodes={len(discovered_nodes)}"
+                    )
                 return existing_routes, discovered_nodes
 
         normalized_runtime = normalize_python_runtime_spec(runtime)
@@ -3724,16 +3803,40 @@ class Service(ServiceExecutionSession):
             create_failure_node_blacklist: Dict[str, str] = {}
             create_request_namespace = uuid.uuid4().hex
             create_request_ids: Dict[str, str] = {}
+            group = cls(
+                owner_client_id=effective_owner_client_id,
+                service_name=effective_service_name,
+                sessions=sessions,
+                nodes=nodes,
+                failures=failures,
+                breaker_enabled=bool(breaker_enabled),
+                breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
+                breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
+                breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
+                _clients=clients,
+                _session_cache_file=session_cache_file,
+                _session_cache_lock=session_cache_lock,
+                _artifact_code_version=effective_code_version,
+                serialization_mode=effective_policy.resolved_mode,
+                policy_id=normalized_policy_id,
+                effective_policy=effective_policy,
+                _deploying=True,
+            )
+            group._owner_node_blacklist.update(create_failure_node_blacklist)  # noqa: SLF001
+            group._create_failure_node_blacklist = group._owner_node_blacklist  # noqa: SLF001
+            group._start_keepalive()
 
             def _mark_deploy_create_failure(node: InfoCenterNode, message: object) -> None:
                 if not is_permanent_replica_create_failure(message, resource_kind="service"):
                     return
                 node_instance_id = _node_instance_key_from_node(node)
                 if node_instance_id:
-                    create_failure_node_blacklist[node_instance_id] = format_replica_create_failure(
+                    reason = format_replica_create_failure(
                         message,
                         resource_kind="service",
                     )
+                    create_failure_node_blacklist[node_instance_id] = reason
+                    group._owner_node_blacklist[node_instance_id] = reason  # noqa: SLF001
 
             def _deploy_create_failure_block_reason(node: InfoCenterNode) -> str:
                 node_instance_id = _node_instance_key_from_node(node)
@@ -3790,7 +3893,7 @@ class Service(ServiceExecutionSession):
 
             def _record_create_results(nodes_to_try: Sequence[InfoCenterNode]) -> None:
                 nonlocal first_failure
-                dispatch_results = dispatch_create_requests(
+                dispatch_results = iter_create_requests_completed(
                     nodes_to_try,
                     create_one=_create_service_on_node,
                     thread_name_prefix="service-deploy",
@@ -3854,9 +3957,8 @@ class Service(ServiceExecutionSession):
                         continue
                     if client is None or session is None:
                         continue
-                    sessions[node_key] = session
-                    clients[node_key] = client
-                    nodes[node_key] = node
+                    if not group._attach_created_replica(node_key, node, client, session, source="deploy"):  # noqa: SLF001
+                        continue
 
             _record_create_results(selected_nodes)
 
@@ -3960,7 +4062,8 @@ class Service(ServiceExecutionSession):
                 _retry_create_after_rediscovery(target_success_nodes=retry_target_success_nodes)
 
             if failures and not allow_partial and len(sessions) < strict_success_nodes:
-                cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
+                group._deploying = False  # noqa: SLF001
+                group.close(end_services=True, reason="rollback deploy")
                 node_key, message = first_failure
                 raise RuntimeError(
                     f"deploy failed on node={node_key}: {message}; "
@@ -3968,7 +4071,8 @@ class Service(ServiceExecutionSession):
                 )
 
             if len(sessions) < required_success_nodes:
-                cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
+                group._deploying = False  # noqa: SLF001
+                group.close(end_services=True, reason="insufficient success nodes")
                 _emit_owner_notice(
                     "deploy failed: insufficient success nodes "
                     f"service_name={effective_service_name} success={len(sessions)} "
@@ -3979,29 +4083,11 @@ class Service(ServiceExecutionSession):
                     f"failures={failures}"
                 )
 
-            group = cls(
-                owner_client_id=effective_owner_client_id,
-                service_name=effective_service_name,
-                sessions=sessions,
-                nodes=nodes,
-                failures=failures,
-                breaker_enabled=bool(breaker_enabled),
-                breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
-                breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
-                breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
-                _clients=clients,
-                _session_cache_file=session_cache_file,
-                _session_cache_lock=session_cache_lock,
-                _artifact_code_version=effective_code_version,
-                serialization_mode=effective_policy.resolved_mode,
-                policy_id=normalized_policy_id,
-                effective_policy=effective_policy,
-            )
+            group._deploying = False  # noqa: SLF001
             group._owner_node_blacklist.update(create_failure_node_blacklist)  # noqa: SLF001
             group._create_failure_node_blacklist = group._owner_node_blacklist  # noqa: SLF001
             group._configure_dynamic_compensation(_dynamic_compensation_spec())
             group._persist_session_cache()
-            group._start_keepalive()
             if failures:
                 _emit_owner_notice(
                     "deploy success with partial failures "
@@ -4016,6 +4102,11 @@ class Service(ServiceExecutionSession):
                 )
             return group
         except Exception:
+            if "group" in locals():
+                with contextlib.suppress(Exception):
+                    group._deploying = False  # noqa: SLF001
+                    group.close(end_services=True, reason="deploy failed")
+                session_cache_lock = None
             if session_cache_lock is not None:
                 session_cache_lock.close()
             raise

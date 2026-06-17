@@ -7,7 +7,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, Generic, Iterator, List, Optional, Sequence, Tuple, TypeVar
 
 from pycloud_parallel.controlplane.artifact import (
     ArtifactExports,
@@ -231,11 +231,50 @@ def dispatch_create_requests(
     return results
 
 
+def iter_create_requests_completed(
+    nodes: Sequence[TNode],
+    *,
+    create_one: Callable[[TNode], TCreated],
+    thread_name_prefix: str,
+    describe_error: Optional[Callable[[TNode, Exception], str]] = None,
+) -> Iterator[CreateDispatchResult[TNode, TCreated]]:
+    """Yield create results as soon as each node finishes.
+
+    Deploy owners use this to start heartbeating early-created replicas while
+    slower nodes are still being created.
+    """
+
+    def _run_create(node: TNode) -> CreateDispatchResult[TNode, TCreated]:
+        try:
+            return CreateDispatchResult(node=node, created=create_one(node), error_message="")
+        except Exception as exc:
+            return CreateDispatchResult(
+                node=node,
+                created=None,
+                error_message=str(describe_error(node, exc) if describe_error is not None else repr(exc)),
+            )
+
+    normalized_nodes = list(nodes)
+    if len(normalized_nodes) <= 1:
+        for node in normalized_nodes:
+            yield _run_create(node)
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=_create_dispatch_max_workers(len(normalized_nodes)),
+        thread_name_prefix=thread_name_prefix,
+    ) as executor:
+        futures = {executor.submit(_run_create, node): node for node in normalized_nodes}
+        for future in as_completed(futures):
+            yield future.result()
+
+
 __all__ = [
     "CreateDispatchResult",
     "classify_replica_create_failures",
     "dispatch_create_requests",
     "format_replica_create_failure",
+    "iter_create_requests_completed",
     "is_permanent_replica_create_failure",
     "normalize_initial_globals",
     "next_replica_create_interval",
