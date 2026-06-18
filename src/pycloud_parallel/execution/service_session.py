@@ -2203,14 +2203,10 @@ class Service(ServiceExecutionSession):
         active: set[str],
     ) -> set[str]:
         current = {str(node_id) for node_id in current_node_instance_ids if str(node_id)}
-        active_snapshot = {str(node_id) for node_id in active if str(node_id)}
         removed: set[str] = set()
-        retry_probe = self._retry_probe_replica_snapshot()
         for node_key in list(self.sessions.keys()):
             normalized = str(node_key or "").strip()
             if not normalized or normalized in current:
-                continue
-            if normalized in active_snapshot and normalized not in retry_probe and not self._is_terminal_replica(normalized):
                 continue
             self._remove_owner_replica(normalized, reason="node instance not present in current InfoCenter discovery")
             removed.add(normalized)
@@ -2335,6 +2331,62 @@ class Service(ServiceExecutionSession):
     def _after_keepalive_tick(self) -> None:
         self._maybe_submit_compensation_after_tick(self._compensation_spec, resource_name=self.service_name)
 
+    def _refresh_compensation_active_replicas(self, spec: Dict[str, Any]) -> None:
+        if not spec or self._closed:
+            return
+        active = self._active_replica_snapshot()
+        if not active:
+            return
+        try:
+            with _infocenter_client(
+                str(spec["infocenter_target"]),
+                timeout_sec=min(5.0, float(spec.get("timeout_sec", 600.0) or 600.0)),
+            ) as infocenter:
+                list_routes = getattr(infocenter, "list_service_routes", None)
+                if not callable(list_routes):
+                    return
+                routes = list(
+                    list_routes(
+                        service_name=self.service_name,
+                        healthy_only=False,
+                        limit=max(len(active), int(spec.get("node_limit", 100) or 100), 1000),
+                        route_scope="owner_command",
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "service compensation route refresh failed service_name=%s active=%s err=%r",
+                self.service_name,
+                sorted(active),
+                exc,
+            )
+            return
+        for route in routes:
+            node_key = _node_instance_key_from_route(route)
+            if not node_key or node_key not in active:
+                continue
+            session = self.sessions.get(node_key)
+            if session is None:
+                continue
+            if str(getattr(route, "service_id", "") or "") != str(getattr(session, "service_id", "") or ""):
+                continue
+            route_status = int(getattr(route, "status", 0) or 0)
+            readiness = str(getattr(route, "readiness", "") or "").strip().lower()
+            resource_health = str(getattr(route, "resource_health", "") or "").strip().lower()
+            terminal_route = (
+                route_status == int(pb2.SERVICE_STATUS_STOPPED)
+                or readiness in {"failed", "stopped"}
+                or resource_health in {"failed", "stopped"}
+            )
+            if terminal_route:
+                self._remove_owner_replica(
+                    node_key,
+                    reason=(
+                        "service route terminal in InfoCenter "
+                        f"status={route_status} readiness={readiness} resource_health={resource_health}"
+                    ),
+                )
+
     def _submit_async_update_globals(self, values: Dict[str, object], *, reason: str = "") -> bool:
         if not values or self._closed:
             return False
@@ -2430,6 +2482,9 @@ class Service(ServiceExecutionSession):
                     )
                 )
             list_nodes_sec += time.monotonic() - list_started_at
+            current_node_instance_ids = {
+                _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
+            }
             select_started_at = time.monotonic()
             requested_instance_ids = [
                 str(item).strip() for item in list(spec.get("node_instance_ids") or ()) if str(item).strip()
@@ -2489,19 +2544,6 @@ class Service(ServiceExecutionSession):
                     ]
             else:
                 active_node_ids = set()
-            current_node_instance_ids = {
-                _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
-            }
-            pruned_owner_replicas = self._prune_stale_owner_replicas(
-                current_node_instance_ids=current_node_instance_ids,
-                active=active,
-            )
-            if pruned_owner_replicas:
-                active = self._active_replica_snapshot()
-                deployed_active = self._active_replica_snapshot()
-                excluded -= pruned_owner_replicas
-                failed = {node_id for node_id in failed if node_id not in pruned_owner_replicas}
-                retryable_failed = {node_id for node_id in retryable_failed if node_id not in pruned_owner_replicas}
             candidate_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in candidates if _node_instance_key_from_node(node)
             }
@@ -2535,6 +2577,7 @@ class Service(ServiceExecutionSession):
                 return 0
             missing = max(0, desired - len(active))
             select_candidates_sec += time.monotonic() - select_started_at
+            timing_lock = threading.Lock()
 
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
                 nonlocal create_rpc_sec
@@ -2579,9 +2622,11 @@ class Service(ServiceExecutionSession):
                         wait_ready=False,
                         timeout_sec=float(spec.get("timeout_sec", 600.0) or 600.0),
                     )
-                    create_rpc_sec += time.monotonic() - create_started_at
+                    with timing_lock:
+                        create_rpc_sec += time.monotonic() - create_started_at
                 except Exception as exc:
-                    create_rpc_sec += time.monotonic() - create_started_at
+                    with timing_lock:
+                        create_rpc_sec += time.monotonic() - create_started_at
                     with contextlib.suppress(Exception):
                         client.close()
                     return node_key, node, None, None, repr(exc)
@@ -2590,9 +2635,30 @@ class Service(ServiceExecutionSession):
                 return node_key, node, client, session, ""
 
             added = 0
-            for node in candidates[:missing]:
+            nodes_to_try = list(candidates[:missing])
+            create_request_ids = spec.setdefault("create_request_ids", {})
+            for node in nodes_to_try:
+                node_key = _node_instance_key_from_node(node)
+                if node_key:
+                    create_request_ids.setdefault(
+                        node_key,
+                        f"service-compensate:{self.owner_client_id}:{self.service_name}:{spec.get('create_request_namespace', '')}:{node_key}",
+                    )
+            for item in iter_create_requests_completed(
+                nodes_to_try,
+                create_one=_create_service_on_node,
+                thread_name_prefix="service-compensate",
+                describe_error=lambda node, exc: repr(exc),
+            ):
                 attempted += 1
-                node_key, node, client, session, error_message = _create_service_on_node(node)
+                if item.created is None:
+                    node = item.node
+                    node_key = _node_instance_key_from_node(node)
+                    client = None
+                    session = None
+                    error_message = item.error_message
+                else:
+                    node_key, node, client, session, error_message = item.created
                 if error_message:
                     with self._route_lock:
                         self.failures[node_key] = error_message
@@ -3880,6 +3946,7 @@ class Service(ServiceExecutionSession):
                             node_key,
                             f"service-create:{effective_owner_client_id}:{effective_service_name}:{create_request_namespace}:{node_key}",
                         ),
+                        wait_ready=False,
                         timeout_sec=timeout_sec,
                     )
                 except Exception as exc:
@@ -4847,14 +4914,20 @@ class Service(ServiceExecutionSession):
         with self._route_lock:
             sessions_snapshot = list(self.sessions.items())
             clients_snapshot = dict(self._clients)
-        active_clients = [clients_snapshot[node_id] for node_id, _ in sessions_snapshot if node_id in clients_snapshot]
         failed_nodes: Dict[str, str] = {}
         update_targets: List[Tuple[str, ServiceSessionClient]] = []
         for node_id, session in sessions_snapshot:
             if getattr(session, "failed", False):
                 failed_nodes[node_id] = str(getattr(session, "last_error", "") or "session failed")
                 continue
+            readiness = str(getattr(session, "readiness", "ready") or "ready").strip().lower()
+            if readiness and readiness != "ready":
+                continue
             update_targets.append((node_id, session))
+        if not update_targets and sessions_snapshot and not failed_nodes:
+            self._last_managed_globals = dict(values or {})
+            return ""
+        active_clients = [clients_snapshot[node_id] for node_id, _ in update_targets if node_id in clients_snapshot]
 
         def _update_batch(
             _node_id: str,

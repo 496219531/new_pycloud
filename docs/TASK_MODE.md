@@ -178,6 +178,8 @@ print(final["job"]["status"])
 2. 失败副本按 `node_instance_id` 记录并跳过，不再占用目标副本数。
 3. 同一个 `node_id` 重启后如果生成新的 `node_instance_id`，可以重新进入补偿候选。
 4. 创建失败、executor host 重建失败、owner heartbeat 超时等原因会随 node heartbeat 上报，并显示在 InfoCenter `/ops` 的 `failure_reason` 列。
+5. pool 仍在创建阶段（例如 `accepted`、`artifact_prepare`、`executor_create`、`globals_warmup` 或 `readiness=initializing`）时，如果 owner heartbeat lease 暂时过期，node 侧会刷新资源租约而不是立刻停止该 pool；创建完成后仍按正常 owner heartbeat timeout 清理。
+6. `task pool executor host missing` / `task pool executor host died` 会归类为 taskpool 终态类 infra 错误，owner 可据此记录失败副本并继续补偿。
 
 节点失效与 inflight task 语义：
 

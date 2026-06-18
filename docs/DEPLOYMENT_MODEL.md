@@ -56,6 +56,8 @@
 
 动态扩容的正确路径是同一个动态发布者扩大目标副本数（例如提高 `node_count`）后重启/恢复 deploy session。部署端会用本地缓存的 `service_id/service_token` 接回自己已经发布的同 code version 服务，并由 keepalive 补齐新增节点；这仍然属于同一个 owner 控制域，不需要也不允许 startup service 参与扩容。
 
+创建中的 service/taskpool 如果 owner heartbeat lease 暂时过期，node 侧会刷新创建中资源租约，避免 `globals_warmup` 等慢启动阶段被误清理。创建完成后仍按正常 owner heartbeat timeout 清理；executor host missing/died 会作为终态类 infra 错误进入 owner 失败副本记录和补偿流程。
+
 ### 2.6 选点策略
 
 当前已经改成统一 scheduler 框架：

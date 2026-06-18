@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +44,7 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 MAX_BODY_BYTES = get_infocenter_http_body_limit_bytes()
 logger = logging.getLogger(__name__)
+_INFOCENTER_SLOW_REQUEST_SEC = 1.0
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -113,6 +115,11 @@ def _failure_text_with_time(reason: object, failure_at: object = None) -> str:
     if parsed_at is None:
         return text
     return f"[{_dt_text(parsed_at)}] {text}"
+
+
+def _is_planned_stop_reason(reason: object) -> bool:
+    normalized = str(reason or "").strip().lower()
+    return normalized in {"scheduled reset", "owner requested", "nodecontrol shutdown"}
 
 
 def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
@@ -258,6 +265,10 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                 "worker_count": max(int(getattr(item, "worker_count", 0) or 0) for item in ordered),
                 "alive_workers": max(int(getattr(item, "alive_workers", 0) or 0) for item in ordered),
                 "in_flight": max(int(getattr(item, "in_flight", 0) or 0) for item in ordered),
+                "created_at": min(
+                    (created_at for item in ordered if (created_at := getattr(item, "created_at", None)) is not None),
+                    default=None,
+                ),
                 "lease_expire_at": max(getattr(item, "lease_expire_at", utc_now()) for item in ordered),
                 "http_base_url": str(primary.http_base_url or ""),
                 "stop_reason": "; ".join(
@@ -274,6 +285,7 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                         item.failure_at
                         for item in ordered
                         if getattr(item, "failure_at", None) is not None
+                        and str(getattr(item, "stop_reason", "") or "").strip()
                     ),
                     default=None,
                 ),
@@ -587,6 +599,7 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
         "worker_count": int(service.worker_count),
         "alive_workers": alive_workers,
         "in_flight": int(service.in_flight if node_healthy else 0),
+        "created_at": _dt_text(getattr(service, "created_at", None)) if getattr(service, "created_at", None) is not None else "",
         "lease_expire_at": _dt_text(service.lease_expire_at),
         "http_base_url": str(service.http_base_url or ""),
         "stop_reason": str(service.stop_reason or ""),
@@ -763,6 +776,7 @@ def _ops_snapshot_content_key(nodes: List[object], *, job_summary: Optional[Dict
                     "ema_child_invoke_ms": float(getattr(svc, "ema_child_invoke_ms", 0.0) or 0.0),
                     "ema_samples": int(getattr(svc, "ema_samples", 0) or 0),
                     "http_base_url": str(getattr(svc, "http_base_url", "") or ""),
+                    "created_at": _dt_text(getattr(svc, "created_at", None)) if getattr(svc, "created_at", None) is not None else "",
                     "stop_reason": str(getattr(svc, "stop_reason", "") or ""),
                     "failure_at": _dt_text(getattr(svc, "failure_at", "")) if getattr(svc, "failure_at", None) is not None else "",
                 }
@@ -1375,6 +1389,18 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         duplicate_count = len(unique_service_ids) or len(ordered)
         if duplicate_count > 1:
             service_id_text = f"{service_id_text} (+{duplicate_count - 1})"
+        active_entries = [
+            entry
+            for entry in ordered
+            if (resource := entry["item"].get("primary")) is not None
+            if bool(entry["node_healthy"])
+            and int(getattr(resource, "status", 0) or 0) == int(pb2.SERVICE_STATUS_RUNNING)
+            and str(getattr(resource, "resource_health", "") or "").strip().lower() not in {"failed", "stopped", "node_lost"}
+            and not str(getattr(resource, "stop_reason", "") or "").strip()
+        ]
+        current_entry = active_entries[0] if active_entries else primary
+        current_item = current_entry["item"]
+        current_resource = current_item.get("primary")
         stop_reasons = [
             _failure_text_with_time(
                 entry["item"].get("stop_reason", ""),
@@ -1385,17 +1411,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ]
         stop_reason = "; ".join(sorted({text for text in stop_reasons if text and text != "-"}))
         max_alive_workers = max(int(entry["item"].get("alive_workers", 0) or 0) for entry in ordered) if any_healthy else 0
-        readiness = str(item.get("readiness", "") or "-")
-        create_stage = str(item.get("create_stage", "") or "-")
-        readiness_reason = "; ".join(
-            sorted(
-                {
-                    str(entry["item"].get("readiness_reason", "") or "").strip()
-                    for entry in ordered
-                    if str(entry["item"].get("readiness_reason", "") or "").strip()
-                }
-            )
-        )
+        readiness = str(getattr(current_resource, "readiness", "") or current_item.get("readiness", "") or "-")
+        create_stage = str(getattr(current_resource, "create_stage", "") or current_item.get("create_stage", "") or "-")
+        readiness_reason = str(getattr(current_resource, "readiness_reason", "") or "").strip()
         dependency_modules = "; ".join(
             sorted(
                 {
@@ -1405,12 +1423,21 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 }
             )
         )
-        resource_health = str(item.get("resource_health", "") or "") or _service_resource_health_text(
+        current_resource_health = str(getattr(current_resource, "resource_health", "") or current_item.get("resource_health", "") or "")
+        current_stop_reason = str(getattr(current_resource, "stop_reason", "") or "")
+        current_status = int(getattr(current_resource, "status", current_item["status"]) or 0)
+        resource_health = current_resource_health or _service_resource_health_text(
             node_healthy=any_healthy,
-            service_status=int(item["status"]),
+            service_status=current_status,
             alive_workers=max_alive_workers,
-            stop_reason=stop_reason,
+            stop_reason=current_stop_reason,
         )
+        created_at_values = [
+            value
+            for entry in ordered
+            if (value := entry["item"].get("created_at")) is not None
+        ]
+        created_at_text = _dt_text(min(created_at_values)) if created_at_values else "-"
         stale_row = "" if any_healthy else " class='stale-row'"
         service_rows.append(
             f"<tr{stale_row}>"
@@ -1419,7 +1446,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(item['service_name']))}</td>"
             f"<td>{service_id_text}</td>"
             f"<td>{_ops_bool_badge(any_healthy)}</td>"
-            f"<td>{_ops_status_badge(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
+            f"<td>{_ops_status_badge(_effective_service_status_text(node_healthy=any_healthy, service_status=current_status))}</td>"
             f"<td>{_ops_status_badge(resource_health)}</td>"
             f"<td>{_ops_status_badge(readiness)}</td>"
             f"<td>{html.escape(create_stage)}</td>"
@@ -1432,6 +1459,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
             f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
             f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
+            f"<td>{html.escape(created_at_text)}</td>"
             f"<td>{html.escape(_dt_text(max(entry['item'].get('lease_expire_at', utc_now()) for entry in ordered)))}</td>"
             f"<td>{html.escape(readiness_reason or '-')}</td>"
             f"<td>{html.escape(dependency_modules or '-')}</td>"
@@ -1440,7 +1468,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "</tr>"
         )
     node_body = "\n".join(node_rows) or "<tr><td colspan='31'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='23'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='24'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
     pool_body = "\n".join(pool_rows) or "<tr><td colspan='29'>no task pools</td></tr>"
@@ -1517,7 +1545,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     service_headers = [
         "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "resource", "readiness", "stage", "workers", "alive", "in_flight",
         "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
-        "lease_expire_at", "readiness_reason", "dependency_modules", "failure_reason", "http_base_url",
+        "created_at", "lease_expire_at", "readiness_reason", "dependency_modules", "failure_reason", "http_base_url",
     ]
     pool_headers = [
         "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "resource", "readiness", "stage", "workers", "alive", "tasks", "in_flight",
@@ -1546,7 +1574,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
         "body:not(.show-details) .ops-table--waiting-jobs :is(th,td):nth-child(2){display:none;}"
-        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+16):nth-child(-n+19),body:not(.show-details) .ops-table--services :is(th,td):nth-child(23){display:none;}"
+        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+16):nth-child(-n+20),body:not(.show-details) .ops-table--services :is(th,td):nth-child(24){display:none;}"
         "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+17):nth-child(-n+27){display:none;}"
         "body:not(.show-details) .ops-table{min-width:900px;}body.show-details .ops-table{min-width:1120px;}.density-toggle{border-color:rgba(34,211,238,.35);color:#cffafe;background:rgba(8,47,73,.5);}.density-toggle:hover{border-color:rgba(34,211,238,.72);background:rgba(14,116,144,.36);}.density-hint{color:#8fb2d9;font-size:12px;width:100%;text-align:right;}"
         ".badge{display:inline-flex;align-items:center;min-height:21px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;line-height:1.2;border:1px solid transparent;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;}.badge-good{background:var(--good-bg);color:var(--good);border-color:rgba(74,222,128,.2);}.badge-warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(251,191,36,.22);}.badge-bad{background:var(--bad-bg);color:var(--bad);border-color:rgba(251,113,133,.22);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);border-color:rgba(203,213,225,.14);}"
@@ -2033,6 +2061,7 @@ class InfoCenterHttpServer:
                         self._send_body(code, raw, content_type=str(headers.get("Content-Type", "application/octet-stream")), extra_headers=headers)
                     return
                 if parsed.path == "/nodes":
+                    request_started_at = time.perf_counter()
                     qs = parse_qs(parsed.query)
                     tags = [x for x in ",".join(qs.get("tags", [])).split(",") if x]
                     node_ids = [x for x in ",".join(qs.get("node_ids", [])).split(",") if x]
@@ -2040,37 +2069,58 @@ class InfoCenterHttpServer:
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["100"]) or ["100"])[0]))
                     try:
-                        nodes = [
-                            _serialize_node(item)
-                            for item in state.list_selected_nodes(
+                        state_started_at = time.perf_counter()
+                        selected_nodes = state.list_selected_nodes(
                                 healthy_only=healthy_only,
                                 tags=tags,
                                 limit=limit,
                                 node_ids=node_ids,
                                 node_instance_ids=node_instance_ids,
                             )
-                        ]
+                        state_sec = time.perf_counter() - state_started_at
+                        serialize_started_at = time.perf_counter()
+                        nodes = [_serialize_node(item) for item in selected_nodes]
+                        serialize_sec = time.perf_counter() - serialize_started_at
                     except (ValueError, RuntimeError) as exc:
                         self._send_json(400, {"ok": False, "error": str(exc)})
                         return
+                    total_sec = time.perf_counter() - request_started_at
                     logger.info(
-                        "[InfoCenter] GET /nodes healthy_only=%s tags=%s node_ids=%s node_instance_ids=%s limit=%d count=%d",
+                        "[InfoCenter] GET /nodes healthy_only=%s tags=%s node_ids=%s node_instance_ids=%s limit=%d count=%d state_sec=%.3f serialize_sec=%.3f total_sec=%.3f",
                         healthy_only,
                         tags,
                         node_ids,
                         node_instance_ids,
                         limit,
                         len(nodes),
+                        state_sec,
+                        serialize_sec,
+                        total_sec,
                     )
+                    if total_sec >= _INFOCENTER_SLOW_REQUEST_SEC:
+                        logger.warning(
+                            "[InfoCenter] slow GET /nodes healthy_only=%s tags=%s node_ids=%s node_instance_ids=%s limit=%d count=%d state_sec=%.3f serialize_sec=%.3f total_sec=%.3f",
+                            healthy_only,
+                            tags,
+                            node_ids,
+                            node_instance_ids,
+                            limit,
+                            len(nodes),
+                            state_sec,
+                            serialize_sec,
+                            total_sec,
+                        )
                     self._send_json(200, {"ok": True, "nodes": nodes})
                     return
                 if parsed.path == "/services/routes":
+                    request_started_at = time.perf_counter()
                     qs = parse_qs(parsed.query)
                     service_name = str((qs.get("service_name", [""]) or [""])[0])
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["500"]) or ["500"])[0]))
                     route_scope = str((qs.get("route_scope", ["call"]) or ["call"])[0] or "call")
                     method = str((qs.get("method", [""]) or [""])[0] or "").strip()
+                    state_started_at = time.perf_counter()
                     routes = state.list_service_routes(
                         service_name=service_name,
                         healthy_only=healthy_only,
@@ -2078,15 +2128,8 @@ class InfoCenterHttpServer:
                         route_scope=route_scope,
                         method=method,
                     )
-                    logger.info(
-                        "[InfoCenter] GET /services/routes service_name=%s healthy_only=%s route_scope=%s method=%s limit=%d count=%d",
-                        service_name,
-                        healthy_only,
-                        route_scope,
-                        method,
-                        limit,
-                        len(routes),
-                    )
+                    state_sec = time.perf_counter() - state_started_at
+                    serialize_started_at = time.perf_counter()
                     serialized = []
                     for item in routes:
                         row = dict(item)
@@ -2102,6 +2145,33 @@ class InfoCenterHttpServer:
                             else ""
                         )
                         serialized.append(row)
+                    serialize_sec = time.perf_counter() - serialize_started_at
+                    total_sec = time.perf_counter() - request_started_at
+                    logger.info(
+                        "[InfoCenter] GET /services/routes service_name=%s healthy_only=%s route_scope=%s method=%s limit=%d count=%d state_sec=%.3f serialize_sec=%.3f total_sec=%.3f",
+                        service_name,
+                        healthy_only,
+                        route_scope,
+                        method,
+                        limit,
+                        len(routes),
+                        state_sec,
+                        serialize_sec,
+                        total_sec,
+                    )
+                    if total_sec >= _INFOCENTER_SLOW_REQUEST_SEC:
+                        logger.warning(
+                            "[InfoCenter] slow GET /services/routes service_name=%s healthy_only=%s route_scope=%s method=%s limit=%d count=%d state_sec=%.3f serialize_sec=%.3f total_sec=%.3f",
+                            service_name,
+                            healthy_only,
+                            route_scope,
+                            method,
+                            limit,
+                            len(routes),
+                            state_sec,
+                            serialize_sec,
+                            total_sec,
+                        )
                     self._send_json(200, {"ok": True, "routes": serialized})
                     return
                 if parsed.path == "/services/routes/diagnose":

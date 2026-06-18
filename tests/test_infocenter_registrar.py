@@ -987,6 +987,55 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
     assert "run: missing_module=pool_missing_pkg" in raw
 
 
+def test_ops_page_does_not_treat_scheduled_reset_history_as_current_service_failure():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    failure_at = datetime(2026, 6, 13, 15, 34, 15, tzinfo=timezone.utc)
+    info_state.register_node_record(
+        node_instance_id="node-reset-history",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-current": NodeServiceState(
+                service_name="fund_analyze_service",
+                service_id="svc-current",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                status_text="SERVICE_STATUS_RUNNING",
+                resource_health="running",
+                readiness="ready",
+                worker_count=6,
+                alive_workers=6,
+                http_base_url="http://127.0.0.1:18081/svc/svc-current",
+            ),
+            "svc-old": NodeServiceState(
+                service_name="fund_analyze_service",
+                service_id="svc-old",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                status_text="SERVICE_STATUS_STOPPED",
+                resource_health="stopped",
+                readiness="stopped",
+                readiness_reason="scheduled reset",
+                worker_count=6,
+                alive_workers=0,
+                stop_reason="scheduled reset",
+                failure_at=failure_at,
+                http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            ),
+        },
+    )
+
+    raw = _render_ops_page(info_state)
+
+    assert raw.count("<td>fund_analyze_service</td>") == 1
+    assert "svc-current (+1)" in raw
+    assert "<span class='badge badge-good'>RUNNING</span>" in raw
+    assert "<span class='badge badge-good'>running</span>" in raw
+    assert "<span class='badge badge-bad'>failed</span>" not in raw
+    assert "[2026-06-13T15:34:15+00:00] scheduled reset" in raw
+
+
 def test_ops_page_separates_node_deploy_and_resource_health():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(

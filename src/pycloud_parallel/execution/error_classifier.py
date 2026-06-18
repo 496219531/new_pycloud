@@ -51,6 +51,8 @@ _SERVICE_TERMINAL_MARKERS = (
     "service not found",
     "service not running",
     "service executor stopped",
+    "service executor host missing",
+    "service executor host died",
 )
 
 _TASK_POOL_TERMINAL_MARKERS = (
@@ -58,6 +60,8 @@ _TASK_POOL_TERMINAL_MARKERS = (
     "task pool not found",
     "pool is stopped",
     "pool not found",
+    "task pool executor host missing",
+    "task pool executor host died",
 )
 
 _IMPORT_ERROR_MARKERS = (

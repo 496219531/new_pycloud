@@ -94,6 +94,8 @@ V1 公开概念固定为：
 5. service/taskpool 创建失败或 executor host 失败时，node 侧应保留 STOPPED 诊断记录
 6. InfoCenter `/ops` 必须显示每条失败 service/taskpool 的 `failure_reason`
 7. 健康服务路由查询仍只返回健康节点上的 `RUNNING` 服务，诊断记录不能污染调用路由
+8. service/taskpool 处于创建阶段时，owner heartbeat lease 暂时过期不应立刻停止资源；node 侧应刷新创建中资源租约，避免慢启动被误判为 owner 失联
+9. `/ops` 合并同名当前实例与历史诊断实例时，当前状态应优先来自健康运行实例，历史 `stop_reason` 只进入 `failure_reason`
 
 ### 6.1 动态部署 code version 一致性
 
@@ -259,9 +261,8 @@ V1 公开概念固定为：
 
 ---
 
-本次更新摘要（2026-04-29）：
+本次更新摘要（2026-06-17）：
 
-1. 对齐 V1 默认绑定：JobQueue 控制面固定 `default_safe + structured_v1`，Service/TaskPool 内部可信默认 `trusted_internal + pickle_stable_v1`，gateway/public 保守禁止 pickle
-2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service module，服务端复用 startup service runtime，JobQueue client 复用 `Service.connect` 底层 route/protocol，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
-3. 确认内部可信 DataRef 主路径：`upload_once -> forward DataRef -> final worker/client remote_fetch`，gateway/public DataRef 边界后续单独收口
-4. 明确默认值变更同步范围：policy profile、runtime config、相关文档与测试必须一起更新
+1. 对齐创建中资源的 heartbeat lease 语义：service/taskpool 在创建阶段暂时过期时刷新租约，不立即停止
+2. 对齐 `/ops` 同名资源合并展示语义：当前运行实例决定状态，历史诊断实例保留在 `failure_reason`
+3. 补充 executor host missing/died 归类为 service/taskpool 终态类 infra 错误，可驱动 owner 记录失败副本并补偿

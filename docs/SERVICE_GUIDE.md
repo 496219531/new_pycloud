@@ -150,6 +150,8 @@ group.shutdown_services(reason="owner shutdown")
 5. 如果部署目标数未满足，owner keepalive 会定期尝试动态补偿；失败的旧实例不会占用目标副本数
 6. 如果同一 `node_instance_id` 上的旧 heartbeat 卡住，但该节点已被重新部署为新 session，owner 会忽略旧 pending heartbeat，继续维护新 session
 7. 如果需要动态扩容，应由同一个部署端提高 `node_count` 后重启/恢复 deploy session；快速重启会接回本 owner 已经部署的同 code version 服务，再由 keepalive 补齐新增节点
+8. service 仍在创建阶段（例如 `accepted`、`artifact_prepare`、`executor_create`、`globals_warmup` 或 `readiness=initializing`）时，如果 owner heartbeat lease 暂时过期，node 侧会刷新资源租约而不是立刻停止该 session；创建完成后的 session 仍按正常 owner heartbeat timeout 清理
+9. `service executor host missing` / `service executor host died` 会归类为 service 终态类 infra 错误，owner keepalive 可据此记录失败副本并触发补偿
 
 更多边界说明见：
 
@@ -464,6 +466,7 @@ pycloudctl gc --scope all --older-than-hours 168
 7. 按 `service_worker_available` 选节点
 8. 部署后如果新 node 加入或旧 node 重启为新实例，owner 会在 keepalive 后台尝试补齐目标副本数
 9. 创建失败或 host 失败的 service 会在 InfoCenter `/ops` 的 `failure_reason` 中显示原因
+10. 创建中的 service 会获得创建阶段租约宽限，避免 `globals_warmup` 等慢启动阶段被 owner heartbeat timeout 误清理
 
 这里的“补齐”是重新部署，不是信任 node 上残留的旧 service 状态。重连节点必须以新的 `node_instance_id` 进入 owner 的发布控制域后，才算当前部署的一部分。
 

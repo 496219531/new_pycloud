@@ -94,6 +94,7 @@ group = Service.deploy(
 5. 失败副本按 `node_instance_id` 记录并跳过，不按可重复的 `node_id` 永久拉黑。
 6. 如果同一个 `node_id` 重启后获得新的 `node_instance_id`，它会重新进入补偿候选。
 7. 创建失败或 host 失败的原因会在 InfoCenter `/ops` 的 `failure_reason` 中显示。
+8. 创建中的 service/taskpool 会获得创建阶段租约宽限，避免慢启动阶段被 owner heartbeat timeout 误清理；创建完成后仍按正常 heartbeat lease 规则处理。
 
 调度状态边界：
 

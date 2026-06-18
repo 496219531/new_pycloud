@@ -633,10 +633,12 @@ V1 删除旧的本地 `foreach/parallel_for` 辅助入口；请使用 `TaskPool`
 
 节点运维：
 
-1. `POST /ops/nodes/{node_id}/cordon`
-2. `POST /ops/nodes/{node_id}/uncordon`
-3. `POST /ops/nodes/{node_id}/drain`
-4. `POST /ops/nodes/{node_id}/undrain`
+1. `POST /ops/nodes/{node_instance_id}/cordon`
+2. `POST /ops/nodes/{node_instance_id}/uncordon`
+3. `POST /ops/nodes/{node_instance_id}/drain`
+4. `POST /ops/nodes/{node_instance_id}/undrain`
+
+这里的路径参数语义是 `node_instance_id`，不是可重复展示名 `node_id`。
 
 ## 推荐阅读顺序
 

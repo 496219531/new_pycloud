@@ -3143,6 +3143,65 @@ def test_task_pool_compensation_replaces_retryable_failed_same_node(monkeypatch)
         session.close()
 
 
+def test_task_pool_compensation_tick_keeps_active_when_discovery_snapshot_misses_node(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution import task_pool as task_pool_mod
+
+    old_node = SimpleNamespace(
+        node_instance_id="node-184-old",
+        node_id="node-184",
+        control_addr="http://10.0.0.184:50061",
+    )
+    current_node = SimpleNamespace(
+        node_instance_id="node-184-new",
+        node_id="node-184",
+        control_addr="http://10.0.0.184:50061",
+    )
+    node_1 = SimpleNamespace(node_instance_id="node-1", node_id="node-1", control_addr="http://10.0.0.1:50061")
+    node_2 = SimpleNamespace(node_instance_id="node-2", node_id="node-2", control_addr="http://10.0.0.2:50061")
+    pools = {
+        "node-1": SimpleNamespace(kind="task_pool", pool_id="pool-1", failed=False, last_error=""),
+        "node-2": SimpleNamespace(kind="task_pool", pool_id="pool-2", failed=False, last_error=""),
+        "node-184-old": SimpleNamespace(kind="task_pool", pool_id="pool-old", failed=False, last_error=""),
+    }
+    session = TaskPool(
+        pools=pools,
+        nodes={"node-1": node_1, "node-2": node_2, "node-184-old": old_node},
+        task_method="run",
+        job_id="job-stale-active",
+    )
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "node_count": 3,
+            "infocenter_target": "127.0.0.1:50051",
+            "healthy_only": True,
+            "tags": [],
+            "node_limit": 100,
+        }
+    )
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [current_node, node_1, node_2]
+
+    monkeypatch.setattr(task_pool_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+    submitted = []
+    session._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+    session._last_compensation_attempt_at = 0.0  # noqa: SLF001
+
+    session._after_keepalive_tick()  # noqa: SLF001
+
+    assert "node-184-old" in session._active_replica_snapshot()  # noqa: SLF001
+    assert "node-184-old" in session._pools  # noqa: SLF001
+    assert submitted == []
+
+
 def test_task_pool_compensation_blacklists_permanent_create_failure_node_id(monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 

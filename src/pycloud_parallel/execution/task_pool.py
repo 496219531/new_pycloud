@@ -1203,6 +1203,52 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def routes(self) -> List[Dict[str, object]]:
         return self.route_summary()
 
+    def _remove_owner_replica(self, node_key: str, *, reason: str = "", clear_failure: bool = False) -> None:
+        normalized = str(node_key or "").strip()
+        if not normalized:
+            return
+        pool = None
+        removed = False
+        with self._pool_lock:
+            removed = normalized in self._pools or normalized in self.nodes
+            pool = self._pools.pop(normalized, None)
+            self.nodes.pop(normalized, None)
+            self._submit_breaker_states.pop(normalized, None)
+            self._scheduler_state.disabled_candidates.discard(normalized)
+            self._discard_active_replica(normalized)
+            self._discard_retry_probe_replica(normalized)
+            if clear_failure:
+                self.failures.pop(normalized, None)
+        if pool is not None:
+            client = getattr(pool, "_client", None)
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
+        if removed:
+            logger.warning(
+                "task pool owner replica removed pool_name=%s node_instance_id=%s reason=%s",
+                str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
+                normalized,
+                str(reason or "").strip(),
+            )
+
+    def _prune_stale_owner_replicas(
+        self,
+        *,
+        current_node_instance_ids: set[str],
+        active: set[str],
+    ) -> set[str]:
+        del active
+        current = {str(node_id) for node_id in current_node_instance_ids if str(node_id)}
+        removed: set[str] = set()
+        for node_key in list(self._pools.keys()):
+            normalized = str(node_key or "").strip()
+            if not normalized or normalized in current:
+                continue
+            self._remove_owner_replica(normalized, reason="node instance not present in current InfoCenter discovery")
+            removed.add(normalized)
+        return removed
+
     def _configure_dynamic_compensation(self, spec: Dict[str, Any]) -> None:
         desired = max(0, int(spec.get("node_count", 0) or 0))
         if desired <= 0:
@@ -1260,6 +1306,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             self._compensation_spec,
             resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or "")
         )
+
+    def _refresh_compensation_active_replicas(self, spec: Dict[str, Any]) -> None:
+        del spec
+        return
 
     def _submit_async_update_globals(self, values: Dict[str, object], *, reason: str = "") -> bool:
         if not values or self._closed:

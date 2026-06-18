@@ -22,8 +22,10 @@ from pycloud_parallel.execution.support import (
     [
         ("service is stopped", "service", ErrorCategory.SERVICE_TERMINAL),
         ("service not found: demo", "service", ErrorCategory.SERVICE_TERMINAL),
+        ("RuntimeError('service executor host missing')", "service", ErrorCategory.SERVICE_TERMINAL),
         ("task pool not running", "task_pool", ErrorCategory.TASK_POOL_TERMINAL),
         ("pool not found", "taskpool", ErrorCategory.TASK_POOL_TERMINAL),
+        ("RuntimeError('task pool executor host missing')", "taskpool", ErrorCategory.TASK_POOL_TERMINAL),
         ("node instance execution is fenced; NodeControl host should exit", "", ErrorCategory.OLD_INSTANCE_IDENTITY_LOST),
         ("node_instance_id fenced", "node", ErrorCategory.OLD_INSTANCE_IDENTITY_LOST),
         ("node control_addr instance mismatch", "", ErrorCategory.IDENTITY_MISMATCH),
@@ -116,7 +118,9 @@ def test_terminal_heartbeat_error_markers(message, resource_kind):
         "heartbeat unavailable",
         "connection reset by peer",
         "service is stopped",
+        "RuntimeError('service executor host missing')",
         "task pool not found",
+        "RuntimeError('task pool executor host missing')",
         "node_instance_id fenced",
     ],
 )

@@ -169,6 +169,13 @@ http://127.0.0.1:50051/ops
 这些指标来自 node 侧服务调用 timing 聚合，并随 heartbeat 同步到 InfoCenter。
 `failure_reason` 用于显示某条 service/taskpool 的创建失败、executor host 重建失败、owner heartbeat 超时等原因。
 
+当同一个 `service_name` / `pool_name` 同时存在当前运行实例和历史诊断实例时，`/ops` 会按名称合并展示：
+
+1. `status`、`resource_health`、`readiness`、`create_stage` 优先取健康节点上的当前运行实例
+2. 已停止实例的 `stop_reason` / `failure_at` 仍会保留在 `failure_reason` 中，便于追溯历史失败
+3. `scheduled reset`、`owner requested`、`nodecontrol shutdown` 等计划内停止原因不应把当前运行实例渲染成失败态
+4. 健康路由仍只返回当前可用实例；历史诊断记录只用于 `/nodes` / `/ops` 观测
+
 如果注册了独立 `job-orchestrator`，`/ops` 页面还会额外显示 `Job Queue` 区块：
 
 1. `current_job_id`

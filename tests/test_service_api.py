@@ -435,6 +435,114 @@ def test_service_compensation_attaches_each_replica_before_next_create_finishes(
     assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
 
 
+def test_service_compensation_starts_create_requests_in_parallel(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node_1 = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    node_2 = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-inst-2",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    create_started = []
+    first_release = threading.Event()
+    both_started = threading.Event()
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_1, node_2]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            node_instance_id = str(kwargs["expected_node_instance_id"])
+            create_started.append(node_instance_id)
+            if len(set(create_started)) == 2:
+                both_started.set()
+            if node_instance_id == "node-inst-1":
+                assert first_release.wait(2.0)
+            return SimpleNamespace(
+                service_id=f"svc-{node_instance_id}",
+                service_token="token",
+                http_base_url=f"http://{self.target}/svc/{node_instance_id}",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_STARTING,
+                readiness="initializing",
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 2,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("added", group.try_compensate_replicas()), daemon=True)
+    worker.start()
+    try:
+        assert both_started.wait(1.0)
+    finally:
+        first_release.set()
+        worker.join(2.0)
+    assert not worker.is_alive()
+    assert result["added"] == 2
+    assert set(create_started) == {"node-inst-1", "node-inst-2"}
+
+
 def test_service_zero_alive_disconnects_owner_replica_and_compensates(monkeypatch) -> None:
     replica = SimpleNamespace(
         kind="service",
@@ -4638,6 +4746,7 @@ class TestOwnerServiceFacade:
         slow_create_started = threading.Event()
         release_slow_create = threading.Event()
         fast_heartbeat_before_slow_release = threading.Event()
+        create_wait_ready = []
 
         class _FakeNodeControlClient:
             def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
@@ -4645,6 +4754,7 @@ class TestOwnerServiceFacade:
                 self.timeout_sec = timeout_sec
 
             def create_service_from_bytes(self, **_kwargs):
+                create_wait_ready.append(_kwargs.get("wait_ready", True))
                 if self.target.endswith(":50062"):
                     slow_create_started.set()
                     assert release_slow_create.wait(timeout=5.0)
@@ -4723,6 +4833,7 @@ class TestOwnerServiceFacade:
 
         try:
             assert sorted(group.sessions) == ["node-a-inst", "node-b-inst"]
+            assert sorted(create_wait_ready) == [False, False]
         finally:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
@@ -5981,6 +6092,72 @@ class TestOwnerServiceFacade:
         finally:
             group._stop_keepalive()  # noqa: SLF001
 
+    def test_owner_keepalive_waits_for_deploy_to_attach_first_replica(self):
+        from pycloud_parallel.execution.service_session import Service
+
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-deploying",
+            sessions={},
+            nodes={},
+            _deploying=True,
+        )
+
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                with group._hb_lock:  # noqa: SLF001
+                    assert group._hb_thread is not None and group._hb_thread.is_alive()  # noqa: SLF001
+                assert group.failed is False
+                time.sleep(0.03)
+        finally:
+            group._deploying = False  # noqa: SLF001
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_keepalive_survives_300s_deploy_without_compensation(self):
+        from pycloud_parallel.execution.service_session import Service
+        import pycloud_parallel.execution.base as base_mod
+
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-slow-deploy",
+            sessions={},
+            nodes={},
+            _deploying=True,
+        )
+        submitted = []
+        group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+        group._configure_dynamic_compensation(  # noqa: SLF001
+            {
+                "node_count": 1,
+                "check_interval_sec": 1.0,
+                "infocenter_target": "127.0.0.1:1",
+            }
+        )
+
+        current = {"value": 1000.0}
+        original_monotonic = base_mod.time.monotonic
+        try:
+            base_mod.time.monotonic = lambda: current["value"]  # type: ignore[assignment]
+            group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+            for _ in range(10):
+                current["value"] += 30.0
+                with group._hb_lock:  # noqa: SLF001
+                    if group._hb_thread is None or not group._hb_thread.is_alive():  # noqa: SLF001
+                        break
+                time.sleep(0.01)
+
+            with group._hb_lock:  # noqa: SLF001
+                assert group._hb_thread is not None and group._hb_thread.is_alive()  # noqa: SLF001
+            assert group.failed is False
+            assert submitted == []
+            assert current["value"] >= 1300.0
+        finally:
+            group._deploying = False  # noqa: SLF001
+            group._stop_keepalive()  # noqa: SLF001
+            base_mod.time.monotonic = original_monotonic  # type: ignore[assignment]
+
     def test_owner_keepalive_continues_while_compensation_is_running(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
         from pycloud_parallel.execution.service_session import Service
@@ -6039,6 +6216,7 @@ class TestOwnerServiceFacade:
             return 0
 
         group.try_compensate_replicas = _slow_compensation  # type: ignore[method-assign]
+        group._refresh_compensation_active_replicas = lambda _spec: None  # type: ignore[method-assign]  # noqa: SLF001
 
         group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
         try:
@@ -6366,6 +6544,62 @@ class TestOwnerServiceFacade:
             release.set()
             group._stop_keepalive()  # noqa: SLF001
 
+    def test_owner_keepalive_picks_up_replicas_added_after_start(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 5
+            heartbeat_failure_threshold = 1
+            service_id = "svc-dynamic"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self, node_id: str):
+                self.node_id = node_id
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replicas = {
+            "node-1": _Replica("node-1"),
+            "node-2": _Replica("node-2"),
+        }
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions=replicas,
+            nodes={},
+        )
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            assert _wait_until(lambda: replicas["node-1"].calls > 0 and replicas["node-2"].calls > 0)
+            replicas["node-3"] = _Replica("node-3")
+            group._add_active_replica("node-3")  # noqa: SLF001
+            group._wake_keepalive()  # noqa: SLF001
+            assert _wait_until(lambda: replicas["node-3"].calls > 0)
+        finally:
+            group._stop_keepalive()  # noqa: SLF001
+
     def test_owner_compensation_tick_uses_recovery_intervals(self):
         from pycloud_parallel.execution.service_session import Service
 
@@ -6396,6 +6630,7 @@ class TestOwnerServiceFacade:
             group._after_keepalive_tick()  # noqa: SLF001
             assert len(submitted) == 1
 
+            group.sessions["node-1"] = SimpleNamespace(kind="service", service_id="svc-1", failed=False, last_error="")
             group._active_replica_ids = {"node-1"}  # noqa: SLF001
             group._last_compensation_attempt_at = 196.0  # noqa: SLF001
             time.monotonic = lambda: 200.0  # type: ignore[assignment]
@@ -6410,6 +6645,7 @@ class TestOwnerServiceFacade:
             group._after_keepalive_tick()  # noqa: SLF001
             assert len(submitted) == 2
 
+            group.sessions["node-2"] = SimpleNamespace(kind="service", service_id="svc-2", failed=False, last_error="")
             group._active_replica_ids = {"node-1", "node-2"}  # noqa: SLF001
             group._last_compensation_attempt_at = 0.0  # noqa: SLF001
             time.monotonic = lambda: 300.0  # type: ignore[assignment]
@@ -6418,6 +6654,266 @@ class TestOwnerServiceFacade:
         finally:
             time.monotonic = original_monotonic  # type: ignore[assignment]
             group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_compensation_tick_keeps_active_when_discovery_snapshot_misses_node(self, monkeypatch):
+        from pycloud_parallel.execution import service_session as service_mod
+        from pycloud_parallel.execution.service_session import Service
+
+        old_node = InfoCenterNode(
+            node_instance_id="node-184-old",
+            node_id="node-184",
+            control_addr="http://10.0.0.184:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=0,
+        )
+        current_node = InfoCenterNode(
+            node_instance_id="node-184-new",
+            node_id="node-184",
+            control_addr="http://10.0.0.184:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=8,
+        )
+        node_1 = InfoCenterNode(
+            node_instance_id="node-1",
+            node_id="node-1",
+            control_addr="http://10.0.0.1:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=2,
+        )
+        node_2 = InfoCenterNode(
+            node_instance_id="node-2",
+            node_id="node-2",
+            control_addr="http://10.0.0.2:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=2,
+        )
+        sessions = {
+            "node-1": SimpleNamespace(kind="service", service_id="svc-1", failed=False, last_error=""),
+            "node-2": SimpleNamespace(kind="service", service_id="svc-2", failed=False, last_error=""),
+            "node-184-old": SimpleNamespace(kind="service", service_id="svc-old", failed=False, last_error=""),
+        }
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions=sessions,
+            nodes={"node-1": node_1, "node-2": node_2, "node-184-old": old_node},
+        )
+        group._configure_dynamic_compensation(  # noqa: SLF001
+            {
+                "node_count": 3,
+                "infocenter_target": "127.0.0.1:50051",
+                "healthy_only": True,
+                "tags": [],
+                "node_limit": 100,
+            }
+        )
+
+        class _FakeInfoCenter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_nodes(self, **_kwargs):
+                return [current_node, node_1, node_2]
+
+            def list_service_routes(self, **_kwargs):
+                return []
+
+        monkeypatch.setattr(service_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+        submitted = []
+        group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+        group._last_compensation_attempt_at = 0.0  # noqa: SLF001
+
+        group._after_keepalive_tick()  # noqa: SLF001
+
+        assert "node-184-old" in group._active_replica_snapshot()  # noqa: SLF001
+        assert "node-184-old" in group.sessions
+        assert submitted == []
+
+    def test_owner_compensation_tick_prunes_stopped_route_before_counting(self, monkeypatch):
+        from pycloud_parallel.execution import service_session as service_mod
+        from pycloud_parallel.execution.service_session import Service
+
+        node_1 = InfoCenterNode(
+            node_instance_id="node-1",
+            node_id="node-1",
+            control_addr="http://10.0.0.1:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=2,
+        )
+        node_2 = InfoCenterNode(
+            node_instance_id="node-2",
+            node_id="node-2",
+            control_addr="http://10.0.0.2:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=2,
+        )
+        node_3 = InfoCenterNode(
+            node_instance_id="node-3",
+            node_id="node-3",
+            control_addr="http://10.0.0.3:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=8,
+        )
+        sessions = {
+            "node-1": SimpleNamespace(kind="service", service_id="svc-1", failed=False, last_error=""),
+            "node-2": SimpleNamespace(kind="service", service_id="svc-2", failed=False, last_error=""),
+            "node-3": SimpleNamespace(kind="service", service_id="svc-3", failed=False, last_error=""),
+        }
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions=sessions,
+            nodes={"node-1": node_1, "node-2": node_2, "node-3": node_3},
+        )
+        group._configure_dynamic_compensation(  # noqa: SLF001
+            {
+                "node_count": 3,
+                "infocenter_target": "127.0.0.1:50051",
+                "healthy_only": True,
+                "tags": [],
+                "node_limit": 100,
+            }
+        )
+        running_route_1 = SimpleNamespace(
+            node_instance_id="node-1",
+            service_id="svc-1",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            readiness="ready",
+            resource_health="running",
+        )
+        running_route_2 = SimpleNamespace(
+            node_instance_id="node-2",
+            service_id="svc-2",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            readiness="ready",
+            resource_health="running",
+        )
+        stopped_route_3 = SimpleNamespace(
+            node_instance_id="node-3",
+            service_id="svc-3",
+            status=pb2.SERVICE_STATUS_STOPPED,
+            readiness="stopped",
+            resource_health="stopped",
+        )
+
+        class _FakeInfoCenter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_service_routes(self, **_kwargs):
+                return [running_route_1, running_route_2, stopped_route_3]
+
+        monkeypatch.setattr(service_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+        submitted = []
+        group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+        group._last_compensation_attempt_at = 0.0  # noqa: SLF001
+
+        group._after_keepalive_tick()  # noqa: SLF001
+
+        assert "node-3" not in group._active_replica_snapshot()  # noqa: SLF001
+        assert "node-3" not in group.sessions
+        assert len(submitted) == 1
+
+    def test_owner_compensation_tick_keeps_initializing_route_active(self, monkeypatch):
+        from pycloud_parallel.execution import service_session as service_mod
+        from pycloud_parallel.execution.service_session import Service
+
+        node = InfoCenterNode(
+            node_instance_id="node-1",
+            node_id="node-1",
+            control_addr="http://10.0.0.1:50061",
+            healthy=True,
+            capacity=8,
+            queue_capacity=100,
+            queued=0,
+            inflight=0,
+            credit=100,
+            service_worker_available=2,
+        )
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": SimpleNamespace(kind="service", service_id="svc-1", failed=False, last_error="")},
+            nodes={"node-1": node},
+        )
+        group._configure_dynamic_compensation(  # noqa: SLF001
+            {
+                "node_count": 1,
+                "infocenter_target": "127.0.0.1:50051",
+                "healthy_only": True,
+                "tags": [],
+                "node_limit": 100,
+            }
+        )
+        initializing_route = SimpleNamespace(
+            node_instance_id="node-1",
+            service_id="svc-1",
+            status=pb2.SERVICE_STATUS_STARTING,
+            readiness="initializing",
+            resource_health="running",
+        )
+
+        class _FakeInfoCenter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_service_routes(self, **_kwargs):
+                return [initializing_route]
+
+        monkeypatch.setattr(service_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+        submitted = []
+        group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+        group._last_compensation_attempt_at = 0.0  # noqa: SLF001
+
+        group._after_keepalive_tick()  # noqa: SLF001
+
+        assert "node-1" in group._active_replica_snapshot()  # noqa: SLF001
+        assert "node-1" in group.sessions
+        assert submitted == []
 
     def test_owner_keepalive_failed_replica_does_not_count_as_active_while_retrying(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
@@ -7052,6 +7548,28 @@ class TestOwnerServiceFacade:
         assert "node-b" in group.failures
         assert group.globals_digests == {"node-a": "sha256:same"}
         client_b.close.assert_called_once()
+
+    def test_service_group_update_globals_skips_initializing_nodes(self):
+        from pycloud_parallel.execution.service_session import Service
+
+        session = SimpleNamespace(failed=False, last_error="", readiness="initializing")
+        session.update_globals_prepared = MagicMock(side_effect=AssertionError("initializing replica must not update globals"))
+        client = MagicMock()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="svc-demo",
+            sessions={"node-init": session},
+            nodes={},
+            _clients={"node-init": client},
+        )
+
+        digest = group.update_globals({"cfg": {"k": "v"}})
+
+        assert digest == ""
+        assert group._last_managed_globals == {"cfg": {"k": "v"}}  # noqa: SLF001
+        assert set(group.sessions) == {"node-init"}
+        session.update_globals_prepared.assert_not_called()
+        client.close.assert_not_called()
 
     def test_service_group_update_globals_allows_per_node_digests(self):
         from pycloud_parallel.execution.service_session import Service

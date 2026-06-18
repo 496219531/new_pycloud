@@ -114,6 +114,8 @@ NodeControl 当前使用 HTTP：
 5. owner 通过心跳保活。
 6. 其他调用方可通过 Gateway 或 discovery 路由调服务方法。
 
+创建中的 service/taskpool 如果 owner heartbeat lease 暂时过期，NodeControl 会在创建阶段刷新资源租约，避免慢启动被误判为 owner 失联；创建完成后仍按正常 owner heartbeat timeout 清理。
+
 两种模式都支持 `runtime` 作为 Python 版本约束：
 
 1. `py3`
@@ -200,6 +202,7 @@ NodeControl 当前使用 HTTP：
 2. 统一查看路由聚合结果。
 3. 统一做节点 `cordon/drain`。
 4. 现在按 `node_instance_id` 精确区分同名节点实例。
+5. `/ops` 合并同名资源时，当前运行实例决定 `status/resource_health/readiness/create_stage`，历史停止原因保留在 `failure_reason` 中用于诊断。
 
 节点状态由谁真正执行：
 

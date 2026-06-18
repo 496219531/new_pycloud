@@ -89,6 +89,8 @@ client.submit(
 4. 它保留 bytes batch submit/results 协议，因为这条链路服务于批量异步和性能
 5. 虽然它和 `Service` 共享一些底座，但不共享 runtime call 协议
 6. `TaskPool.open(..., initial_globals={...})` 会在创建期同步注入 globals，worker pool 就绪后首次 submit 即可看到；`pool.update_globals(...)` 保持创建后的 owner 热更新语义
+7. pool 处于 `accepted`、`artifact_prepare`、`executor_create`、`globals_warmup` 或 `readiness=initializing` 时，如果 owner heartbeat lease 暂时过期，node 侧会刷新资源租约而不是立刻停止它
+8. `task pool executor host missing` / `task pool executor host died` 会归类为 taskpool 终态类 infra 错误，owner 可记录失败副本并继续补偿
 
 补充边界：
 

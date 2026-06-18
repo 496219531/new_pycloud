@@ -161,6 +161,8 @@
 1. Owner 周期性调用 `HeartbeatService`。
 2. 超时未续租则服务会被回收。
 
+创建阶段有一个例外：如果 service 仍处于 `accepted`、`artifact_prepare`、`executor_create`、`globals_warmup`，或 `readiness=initializing`，NodeControl 会刷新资源租约而不是立刻按 owner heartbeat timeout 停止它。创建完成后仍按正常续租规则回收。
+
 ### 6.3 主动结束
 
 1. Owner 调用 `EndService`。
@@ -203,6 +205,8 @@ Python 客户端当前会在本地缓存：
 4. 本地 token 缓存仍然存在
 
 如果满足这些条件，可以直接复用远端活跃服务，而不重新上传。
+
+如果 executor host 在运行期缺失或退出，相关错误会归类为 service 终态类 infra 错误。owner keepalive 应记录对应 `node_instance_id` 的失败副本，并通过动态补偿重新部署到可用实例。
 
 ## 10. 节点选择
 

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -65,6 +66,8 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error
+
+logger = logging.getLogger(__name__)
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 if TYPE_CHECKING:
@@ -162,17 +165,31 @@ def _retry_infocenter_request(
 ) -> Any:
     deadline = time.monotonic() + max(0.1, float(timeout_sec))
     last_exc: Optional[Exception] = None
+    attempt = 0
+    last_log_at = 0.0
     while True:
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {last_exc}"
             )
         try:
+            attempt += 1
             return fn()
         except Exception as exc:
             if not isinstance(exc, _RetryableReadyError) and not _is_transient_infocenter_error(exc):
                 raise
             last_exc = exc
+            now = time.monotonic()
+            if now - last_log_at >= 5.0:
+                last_log_at = now
+                logger.warning(
+                    "InfoCenter request retrying target=%s action=%s attempt=%d remaining_sec=%.3f error=%r",
+                    target,
+                    action,
+                    attempt,
+                    max(0.0, deadline - now),
+                    exc,
+                )
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {exc}"

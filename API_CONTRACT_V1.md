@@ -79,9 +79,14 @@
       "service_name": "square-service",
       "service_id": "svc-001",
       "status": 2,
+      "status_text": "SERVICE_STATUS_RUNNING",
       "worker_count": 1,
       "alive_workers": 1,
       "in_flight": 0,
+      "resource_health": "running",
+      "readiness": "ready",
+      "create_stage": "ready",
+      "stop_reason": "",
       "http_base_url": "http://127.0.0.1:18081/svc/svc-001"
     }
   ]
@@ -183,6 +188,8 @@
 2. `node_instance_id`
    - InfoCenter 内部真正的节点主键
    - `/ops` 运维动作按它定位
+
+`/ops` 会把同名 service/taskpool 的当前实例和历史诊断记录合并展示。当前状态优先来自健康运行实例；已停止实例的 `stop_reason` / `failure_at` 只进入 `failure_reason`，不应把当前运行实例染成失败态。
 
 ## 2. 服务 HTTP 数据面
 

@@ -389,6 +389,8 @@ gateway public 还有一个需要特别记住的边界：
 5. startup service 不能动态加入任何现有服务组；同一个 `service_name` 上动态部署与 startup service 双向互斥
 6. 任一方已存在时，另一方不能因为 code version 一致而启动/部署
 7. 动态扩容由同一个动态 owner 调整目标副本数并重启/恢复 deploy session 完成；快速重启可接回该 owner 已部署的同 code version 服务，再补齐新增节点
+8. 创建中的 service/taskpool 如果 owner heartbeat lease 暂时过期，node 侧刷新资源租约，不立即停止；创建完成后仍按正常 owner heartbeat timeout 清理
+9. executor host missing/died 属于对应 service/taskpool 的终态类 infra 错误，owner 可据此记录失败副本并补偿
 
 `JobQueue.connect()` 也遵循同样的边界：
 

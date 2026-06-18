@@ -47,6 +47,14 @@
 6. node 端 submit/call/result 热路径是性能敏感区，后续共享只允许发生在低频 create/status/control path
 7. service stream 只承载小型 inline item；单个 item 超过 inline result hard limit 时直接失败，不自动转 `DataRef`
 
+## 生命周期与诊断边界
+
+1. service/taskpool 都由 owner heartbeat lease 驱动生命周期清理
+2. 创建阶段（`accepted` / `artifact_prepare` / `executor_create` / `globals_warmup` / `readiness=initializing`）暂时过期时，node 侧刷新资源租约，不立即停止资源
+3. 创建完成后仍按正常 owner heartbeat timeout 清理
+4. executor host missing/died 会归类为对应 service/taskpool 的终态类 infra 错误
+5. InfoCenter `/ops` 可以同时保留当前运行实例和历史诊断实例；历史 `stop_reason` 进入 `failure_reason`，不改变当前运行实例状态
+
 ## Startup Service
 
 `Service.startup(...)` 可以复用 service route/call/status 模型，但它不等于中心统一 deploy 的多副本 service。

@@ -498,6 +498,94 @@ def test_nodecontrol_service_create_wait_ready_false_returns_before_warmup(tmp_p
         state.close()
 
 
+def test_nodecontrol_service_async_create_survives_300s_warmup_with_heartbeat(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-300s",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_300s"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    current_time = {"value": t0}
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+    stopped = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            return None
+
+        def stop_service(self, **kwargs):
+            stopped.append(dict(kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-async-300s",
+            service_name="svc-async-300s",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_300s",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-create-300s",
+            wait_ready=False,
+        )
+
+        assert artifact_ready_started.wait(timeout=2.0)
+        assert session.status == pb2.SERVICE_STATUS_STARTING
+        assert session.readiness == "initializing"
+        assert session.lease_expire_at == t0 + timedelta(seconds=30)
+
+        current_time["value"] = t0 + timedelta(seconds=300)
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert stopped == []
+        assert session.status == pb2.SERVICE_STATUS_STARTING
+        assert session.lease_expire_at == current_time["value"] + timedelta(seconds=30)
+
+        hb = state.heartbeat_service(
+            owner_client_id="owner-async-300s",
+            service_id=session.service_id,
+            service_token=session.service_token,
+        )
+        assert hb.service_id == session.service_id
+        assert hb.readiness == "initializing"
+        assert session.lease_expire_at == current_time["value"] + timedelta(seconds=30)
+        assert stopped == []
+    finally:
+        release_artifact_ready.set()
+        state.close()
+
+
 def test_nodecontrol_service_create_wait_ready_false_returns_before_put_code(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-service-async-put-code",
