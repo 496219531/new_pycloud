@@ -2801,32 +2801,27 @@ def _dedupe_nodes_for_host_upgrade(nodes: Sequence[object]) -> Tuple[List[object
     return selected, skipped
 
 
-def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
-    target = str(args.target or "").strip() or f"{_LOCALHOST}:{int(getattr(args, 'controlplane_port', 50051) or 50051)}"
-    wheel_path = Path(args.wheel).expanduser().resolve()
-    if not wheel_path.is_file():
-        raise FileNotFoundError(f"wheel not found: {wheel_path}")
-    if wheel_path.suffix.lower() != ".whl":
-        raise ValueError(f"--wheel must point to a .whl file: {wheel_path}")
-    node_ids = [item.strip() for item in str(args.node_ids or "").split(",") if item.strip()]
-    node_instance_ids = [item.strip() for item in str(args.node_instance_ids or "").split(",") if item.strip()]
-    tags = [item.strip() for item in str(args.tags or "").split(",") if item.strip()]
+def _split_csv_arg(value: object) -> List[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _select_nodecontrol_nodes_for_ctl(args: argparse.Namespace, target: str) -> Tuple[List[object], List[Dict[str, str]]]:
+    node_ids = _split_csv_arg(getattr(args, "node_ids", ""))
+    node_instance_ids = _split_csv_arg(getattr(args, "node_instance_ids", ""))
+    tags = _split_csv_arg(getattr(args, "tags", ""))
     with InfoCenterClient(target, timeout_sec=float(args.timeout_sec)) as client:
         nodes = list(
             client.list_selected_nodes(
-                healthy_only=not bool(args.include_unhealthy),
+                healthy_only=not bool(getattr(args, "include_unhealthy", False)),
                 tags=tags,
-                limit=max(1, int(args.limit or 1000)),
+                limit=max(1, int(getattr(args, "limit", 1000) or 1000)),
                 node_ids=node_ids or None,
                 node_instance_ids=node_instance_ids or None,
             )
         )
     nodes = [node for node in nodes if str(getattr(node, "control_addr", "") or "").strip()]
-    if not nodes:
-        print("no nodes selected")
-        return 1
     skipped_duplicates: List[Dict[str, str]] = []
-    if not bool(args.no_dedupe_host):
+    if nodes and not bool(getattr(args, "no_dedupe_host", False)):
         nodes, skipped_duplicates = _dedupe_nodes_for_host_upgrade(nodes)
         for item in skipped_duplicates:
             print(
@@ -2835,6 +2830,20 @@ def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
                 f"{item.get('control_addr')} reason=duplicate_host host={item.get('host_key')} "
                 f"selected={item.get('selected_node_instance_id')}"
             )
+    return nodes, skipped_duplicates
+
+
+def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
+    target = str(args.target or "").strip() or f"{_LOCALHOST}:{int(getattr(args, 'controlplane_port', 50051) or 50051)}"
+    wheel_path = Path(args.wheel).expanduser().resolve()
+    if not wheel_path.is_file():
+        raise FileNotFoundError(f"wheel not found: {wheel_path}")
+    if wheel_path.suffix.lower() != ".whl":
+        raise ValueError(f"--wheel must point to a .whl file: {wheel_path}")
+    nodes, skipped_duplicates = _select_nodecontrol_nodes_for_ctl(args, target)
+    if not nodes:
+        print("no nodes selected")
+        return 1
     if bool(args.dry_run):
         print(
             json.dumps(
@@ -2867,6 +2876,7 @@ def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
     )
     rows = []
     failures = 0
+    upgraded_host_keys: set[str] = set()
     restart_only_nodes = {str(item.get("node_instance_id", "") or ""): item for item in skipped_duplicates if str(item.get("control_addr", "") or "").strip()}
     for node in nodes:
         node_instance_id = str(node.node_instance_id or node.node_id or node.control_addr)
@@ -2892,6 +2902,8 @@ def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
             ok = bool(result.get("ok", False))
             if not ok:
                 failures += 1
+            else:
+                upgraded_host_keys.add(_upgrade_node_host_key(node.control_addr))
             rows.append(
                 {
                     "node_id": node.node_id,
@@ -2914,6 +2926,8 @@ def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
                 break
     if bool(args.restart):
         for item in restart_only_nodes.values():
+            if str(item.get("host_key", "") or "") not in upgraded_host_keys:
+                continue
             node_instance_id = str(item.get("node_instance_id") or item.get("node_id") or item.get("control_addr") or "")
             control_addr = str(item.get("control_addr", "") or "")
             try:
@@ -2946,6 +2960,140 @@ def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+def _cmd_install_node_packages(args: argparse.Namespace) -> int:
+    target = str(args.target or "").strip() or f"{_LOCALHOST}:{int(getattr(args, 'controlplane_port', 50051) or 50051)}"
+    requirements = [str(item).strip() for item in list(args.requirement or []) if str(item).strip()]
+    if not requirements:
+        raise ValueError("at least one --requirement is required")
+    nodes, skipped_duplicates = _select_nodecontrol_nodes_for_ctl(args, target)
+    if not nodes:
+        print("no nodes selected")
+        return 1
+    if bool(args.dry_run):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "target": target,
+                    "requirements": requirements,
+                    "nodes": [
+                        {
+                            "node_id": node.node_id,
+                            "node_instance_id": node.node_instance_id,
+                            "control_addr": node.control_addr,
+                        }
+                        for node in nodes
+                    ],
+                    "skipped_duplicates": skipped_duplicates,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    pip_args = list(args.pip_arg or [])
+    admin_token = _resolve_admin_token_for_ctl(
+        _runtime_root(str(getattr(args, "runtime_root", "") or "")),
+        explicit=str(args.api_token or ""),
+    )
+    rows = []
+    failures = 0
+    installed_host_keys: set[str] = set()
+    restart_only_nodes = {
+        str(item.get("node_instance_id", "") or ""): item
+        for item in skipped_duplicates
+        if str(item.get("control_addr", "") or "").strip()
+    }
+    for node in nodes:
+        node_instance_id = str(node.node_instance_id or node.node_id or node.control_addr)
+        try:
+            with NodeControlClient(node.control_addr, timeout_sec=float(args.timeout_sec), api_token=admin_token) as node_client:
+                result = node_client.install_packages(
+                    requirements=requirements,
+                    pip_args=pip_args,
+                    timeout_sec=float(args.timeout_sec),
+                )
+            ok = bool(result.get("ok", False))
+            if not ok:
+                failures += 1
+            else:
+                installed_host_keys.add(_upgrade_node_host_key(node.control_addr))
+            restart_result = {}
+            if ok and bool(getattr(args, "restart", False)):
+                with NodeControlClient(node.control_addr, timeout_sec=float(args.timeout_sec), api_token=admin_token) as node_client:
+                    restart_result = node_client.restart_node(delay_sec=1.0, api_token=admin_token)
+                if not bool(restart_result.get("ok", False)):
+                    failures += 1
+            rows.append(
+                {
+                    "node_id": node.node_id,
+                    "node_instance_id": node_instance_id,
+                    "control_addr": node.control_addr,
+                    "ok": ok,
+                    "returncode": result.get("returncode"),
+                    "restart_scheduled": restart_result.get("restart_scheduled") if restart_result else False,
+                    "error": result.get("error", ""),
+                }
+            )
+            restart_suffix = f" restart_scheduled={restart_result.get('restart_scheduled')}" if restart_result else ""
+            print(f"{'OK' if ok else 'FAIL'} {node_instance_id} {node.control_addr} requirements={requirements}{restart_suffix}")
+            if (not ok or (restart_result and not bool(restart_result.get("ok", False)))) and not bool(args.continue_on_error):
+                break
+        except Exception as exc:
+            failures += 1
+            rows.append({"node_id": node.node_id, "node_instance_id": node_instance_id, "control_addr": node.control_addr, "ok": False, "error": str(exc)})
+            print(f"FAIL {node_instance_id} {node.control_addr} error={exc}")
+            if not bool(args.continue_on_error):
+                break
+    if bool(getattr(args, "restart", False)):
+        for item in restart_only_nodes.values():
+            if str(item.get("host_key", "") or "") not in installed_host_keys:
+                continue
+            node_instance_id = str(item.get("node_instance_id") or item.get("node_id") or item.get("control_addr") or "")
+            control_addr = str(item.get("control_addr", "") or "")
+            try:
+                with NodeControlClient(control_addr, timeout_sec=float(args.timeout_sec), api_token=admin_token) as node_client:
+                    result = node_client.restart_node(delay_sec=1.0, api_token=admin_token)
+                ok = bool(result.get("ok", False))
+                if not ok:
+                    failures += 1
+                rows.append(
+                    {
+                        "node_instance_id": node_instance_id,
+                        "control_addr": control_addr,
+                        "ok": ok,
+                        "install_skipped": True,
+                        "restart_scheduled": result.get("restart_scheduled"),
+                        "error": result.get("error", ""),
+                    }
+                )
+                print(f"{'OK' if ok else 'FAIL'} {node_instance_id} {control_addr} install_skipped=True restart_scheduled={result.get('restart_scheduled')}")
+                if not ok and not bool(args.continue_on_error):
+                    break
+            except Exception as exc:
+                failures += 1
+                rows.append({"node_instance_id": node_instance_id, "control_addr": control_addr, "ok": False, "install_skipped": True, "error": str(exc)})
+                print(f"FAIL {node_instance_id} {control_addr} install_skipped=True error={exc}")
+                if not bool(args.continue_on_error):
+                    break
+    if bool(args.json):
+        print(
+            json.dumps(
+                {
+                    "ok": failures == 0,
+                    "target": target,
+                    "requirements": requirements,
+                    "nodes": rows,
+                    "skipped_duplicates": skipped_duplicates,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return 0 if failures == 0 else 1
+
+
 def _generate_admin_token() -> str:
     return secrets.token_urlsafe(32)
 
@@ -2955,26 +3103,60 @@ def _admin_token_file(root: Path) -> Path:
 
 
 def _load_local_admin_token(root: Path) -> str:
+    return _load_local_admin_token_window(root)[0]
+
+
+def _load_local_admin_token_window(root: Path) -> Tuple[str, List[str]]:
     try:
-        return _admin_token_file(root).read_text(encoding="utf-8").strip()
+        text = _admin_token_file(root).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return ""
+        return "", []
+    if not text:
+        return "", []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text, []
+    if not isinstance(data, dict):
+        return text, []
+    current = str(data.get("current_token") or data.get("admin_token") or "").strip()
+    previous_raw = data.get("previous_tokens") or []
+    previous = [str(item).strip() for item in list(previous_raw) if str(item).strip()] if isinstance(previous_raw, list) else []
+    return current, previous[:2]
 
 
-def _write_local_admin_token(root: Path, token: str) -> None:
-    normalized = str(token or "").strip()
+def _write_local_admin_token_window(root: Path, current_token: str, previous_tokens: Sequence[str] = ()) -> None:
+    normalized = str(current_token or "").strip()
     if not normalized:
         raise ValueError("admin token must not be empty")
     path = _admin_token_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-    tmp.write_text(normalized + "\n", encoding="utf-8")
+    previous: List[str] = []
+    seen = {normalized}
+    for item in previous_tokens:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        previous.append(value)
+        seen.add(value)
+        if len(previous) >= 2:
+            break
+    payload = {
+        "current_token": normalized,
+        "previous_tokens": previous,
+    }
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         os.replace(str(tmp), str(path))
     finally:
         if tmp.exists():
             with contextlib.suppress(OSError):
                 tmp.unlink()
+
+
+def _write_local_admin_token(root: Path, token: str) -> None:
+    _write_local_admin_token_window(root, token, [])
 
 
 def _resolve_admin_token_for_ctl(root: Path, *, explicit: str = "") -> str:
@@ -3025,12 +3207,19 @@ def _ensure_controlplane_host_command_allowed(target: str, *, allow_remote: bool
 
 def _cmd_admin_token(args: argparse.Namespace) -> int:
     root = _runtime_root(str(getattr(args, "runtime_root", "") or ""))
-    local_old_token = _load_local_admin_token(root)
+    local_current_token, local_previous_tokens = _load_local_admin_token_window(root)
     admin_token = str(args.token or "").strip() or _generate_admin_token()
-    old_admin_token = str(args.old_token or "").strip() or local_old_token
+    explicit_old_token = str(args.old_token or "").strip()
+    old_admin_tokens = []
+    if explicit_old_token:
+        old_admin_tokens.append(explicit_old_token)
+    else:
+        old_admin_tokens.extend([local_current_token, *local_previous_tokens])
+    old_admin_tokens = [item for item in old_admin_tokens if item][:3]
     target = str(args.target or "").strip()
     if bool(args.generate_only):
-        _write_local_admin_token(root, admin_token)
+        previous_tokens = [local_current_token, *local_previous_tokens] if local_current_token else local_previous_tokens
+        _write_local_admin_token_window(root, admin_token, previous_tokens)
         print(admin_token)
         return 0
     if not target:
@@ -3053,18 +3242,9 @@ def _cmd_admin_token(args: argparse.Namespace) -> int:
     if not nodes:
         print("no nodes selected")
         return 1
-    skipped_duplicates: List[Dict[str, str]] = []
-    if not bool(args.no_dedupe_host):
-        nodes, skipped_duplicates = _dedupe_nodes_for_host_upgrade(nodes)
-        for item in skipped_duplicates:
-            print(
-                "SKIP "
-                f"{item.get('node_instance_id') or item.get('node_id')} "
-                f"{item.get('control_addr')} reason=duplicate_host host={item.get('host_key')} "
-                f"selected={item.get('selected_node_instance_id')}"
-            )
     rows = []
     failures = 0
+    successes = 0
     for node in nodes:
         node_instance_id = str(node.node_instance_id or node.node_id or node.control_addr)
         if bool(args.dry_run):
@@ -3072,10 +3252,12 @@ def _cmd_admin_token(args: argparse.Namespace) -> int:
             continue
         try:
             with NodeControlClient(node.control_addr, timeout_sec=float(args.timeout_sec)) as node_client:
-                result = node_client.set_admin_token(admin_token=admin_token, old_admin_token=old_admin_token)
+                result = node_client.set_admin_token(admin_token=admin_token, old_admin_tokens=old_admin_tokens)
             ok = bool(result.get("ok", False))
             if not ok:
                 failures += 1
+            else:
+                successes += 1
             rows.append(
                 {
                     "node_id": node.node_id,
@@ -3104,14 +3286,15 @@ def _cmd_admin_token(args: argparse.Namespace) -> int:
                     "target": target,
                     "admin_token": admin_token if bool(args.show_token) else "",
                     "nodes": rows,
-                    "skipped_duplicates": skipped_duplicates,
+                    "skipped_duplicates": [],
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-    if failures == 0 and not bool(args.dry_run):
-        _write_local_admin_token(root, admin_token)
+    if successes > 0 and not bool(args.dry_run):
+        previous_tokens = [local_current_token, *local_previous_tokens] if local_current_token else local_previous_tokens
+        _write_local_admin_token_window(root, admin_token, previous_tokens)
     if failures == 0 and bool(args.show_token) and not (bool(args.json) or bool(args.dry_run)):
         print(f"admin_token={admin_token}")
     return 0 if failures == 0 else 1
@@ -3382,6 +3565,22 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade_nodes_parser.add_argument("--api-token", default="", help="NodeControl admin token; defaults to local <runtime-root>/admin_token when omitted")
     upgrade_nodes_parser.add_argument("--pip-arg", action="append", default=[], help="extra argument appended to pip install; may be repeated")
     upgrade_nodes_parser.add_argument("--json", action="store_true", help="print JSON summary")
+    install_packages_parser = subparsers.add_parser("install-node-packages", help="pip install packages on selected NodeControl nodes")
+    _add_target_argument(install_packages_parser, help="InfoCenter/ControlPlane target used to discover nodes")
+    install_packages_parser.add_argument("--requirement", action="append", required=True, help="pip requirement to install; may be repeated, e.g. setuptools==65.5.0")
+    install_packages_parser.add_argument("--node-ids", default="", help="comma-separated node_id filter")
+    install_packages_parser.add_argument("--node-instance-ids", default="", help="comma-separated node_instance_id filter")
+    install_packages_parser.add_argument("--tags", default="", help="comma-separated node tag filter")
+    install_packages_parser.add_argument("--limit", type=int, default=1000, help="max nodes to query")
+    install_packages_parser.add_argument("--include-unhealthy", action="store_true", help="include unhealthy nodes in discovery")
+    install_packages_parser.add_argument("--no-dedupe-host", action="store_true", help="install on every selected node, even when multiple nodes share the same host")
+    install_packages_parser.add_argument("--continue-on-error", action="store_true", help="continue installing remaining nodes after a failure")
+    install_packages_parser.add_argument("--dry-run", action="store_true", help="show selected nodes without installing")
+    install_packages_parser.add_argument("--restart", action="store_true", help="ask each successfully installed node to restart NodeControl")
+    install_packages_parser.add_argument("--timeout-sec", type=float, default=300.0, help="per-node install timeout")
+    install_packages_parser.add_argument("--api-token", default="", help="NodeControl admin token; defaults to local <runtime-root>/admin_token when omitted")
+    install_packages_parser.add_argument("--pip-arg", action="append", default=[], help="extra argument appended to pip install; may be repeated")
+    install_packages_parser.add_argument("--json", action="store_true", help="print JSON summary")
     admin_token_parser = subparsers.add_parser("admin-token", help="generate or set NodeControl admin tokens")
     _add_target_argument(admin_token_parser, help="InfoCenter/ControlPlane target used to discover nodes")
     admin_token_parser.add_argument("--token", default="", help="new admin token; generated and saved locally when omitted")
@@ -3393,7 +3592,7 @@ def build_parser() -> argparse.ArgumentParser:
     admin_token_parser.add_argument("--tags", default="", help="comma-separated node tag filter")
     admin_token_parser.add_argument("--limit", type=int, default=1000, help="max nodes to query")
     admin_token_parser.add_argument("--include-unhealthy", action="store_true", help="include unhealthy nodes in discovery")
-    admin_token_parser.add_argument("--no-dedupe-host", action="store_true", help="set every selected node, even when multiple nodes share the same host")
+    admin_token_parser.add_argument("--no-dedupe-host", action="store_true", help=argparse.SUPPRESS)
     admin_token_parser.add_argument("--allow-remote", action="store_true", help="allow running from a host other than the target ControlPlane host")
     admin_token_parser.add_argument("--continue-on-error", action="store_true", help="continue updating remaining nodes after a failure")
     admin_token_parser.add_argument("--dry-run", action="store_true", help="show selected nodes without updating")
@@ -3453,6 +3652,8 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_gc(args)
     if args.command == "upgrade-nodes":
         return _cmd_upgrade_nodes(args)
+    if args.command == "install-node-packages":
+        return _cmd_install_node_packages(args)
     if args.command == "admin-token":
         return _cmd_admin_token(args)
     parser.error(f"unknown command: {args.command}")

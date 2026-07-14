@@ -217,6 +217,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "returned_count": int(resource.returned_count),
         "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
         "ema_samples": int(metrics.get("ema_samples", 0) or 0),
+        "created_at": session.created_at.isoformat(),
         "lease_expire_at": lease_expire_at.isoformat(),
         "failure_at": session.failure_at.isoformat() if getattr(session, "failure_at", None) is not None else "",
         "http_base_url": session.http_base_url,

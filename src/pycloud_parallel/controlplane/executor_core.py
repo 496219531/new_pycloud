@@ -12,6 +12,8 @@ import queue
 import time
 from typing import Any, Callable, Dict, Optional
 
+from pycloud_parallel.runtime.executors import _shutdown_executor
+
 logger = logging.getLogger(__name__)
 
 EmitFunc = Callable[[Dict[str, Any]], None]
@@ -237,7 +239,7 @@ class ExecutorCore:
             return
         processes = list(getattr(executor, "_processes", {}).values())
         try:
-            executor.shutdown(wait=False, cancel_futures=True)
+            _shutdown_executor(executor, wait=False, cancel_futures=True)
         except Exception:
             pass
         for proc in processes:

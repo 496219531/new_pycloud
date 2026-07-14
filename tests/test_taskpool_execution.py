@@ -815,6 +815,44 @@ def test_native_task_pool_session_dynamic_default_max_in_flight_prefers_pool_wor
         session.close()
 
 
+def test_task_pool_adaptive_inflight_maps_result_interval_to_window() -> None:
+    from pycloud_parallel.execution.task_pool import _AdaptiveInflightController
+
+    controller = _AdaptiveInflightController(
+        active_workers=2,
+        initial_window=24,
+        target_backlog_sec=60.0,
+        ema_alpha=1.0,
+        max_window=48,
+    )
+
+    assert controller.window == 24
+    assert controller.observe_result_batch(count=1, now=100.0) is False
+    assert controller.observe_result_batch(count=1, now=110.0) is True
+    assert controller.ema_result_interval_sec == pytest.approx(10.0)
+    assert controller.window < 24
+
+    previous = controller.window
+    assert controller.observe_result_batch(count=20, now=111.0) is True
+    assert controller.ema_result_interval_sec == pytest.approx(0.05)
+    assert controller.window > previous
+
+
+def test_task_pool_adaptive_inflight_timeout_halves_window() -> None:
+    from pycloud_parallel.execution.task_pool import _AdaptiveInflightController
+
+    controller = _AdaptiveInflightController(active_workers=4, initial_window=20, max_window=64)
+
+    assert controller.on_timeout() is True
+    assert controller.window == 10
+    assert controller.on_timeout() is True
+    assert controller.window == 5
+    assert controller.on_timeout() is True
+    assert controller.window == 4
+    assert controller.on_timeout() is False
+    assert controller.window == 4
+
+
 def test_iter_items_merges_shared_kwargs_lazily() -> None:
     from pycloud_parallel import TaskPool
 
@@ -853,7 +891,40 @@ def test_iter_items_merges_shared_kwargs_lazily() -> None:
         session.close()
 
 
-def test_task_pool_map_uses_dynamic_default_max_in_flight_by_default() -> None:
+def test_iter_items_preserves_none_max_in_flight_for_adaptive_default() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=2,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool},
+        nodes={"node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=2)},
+        task_method="run",
+    )
+
+    def _fake_imap(payloads, **kwargs):
+        assert kwargs["max_in_flight"] is None
+        assert kwargs["receive_batch"] == 3
+        first = next(iter(payloads))
+        yield ExecutionItem(index=0, ok=True, result=first, key=0)
+
+    from pycloud_parallel.execution.base import ExecutionItem
+
+    try:
+        with patch.object(session, "imap_unordered", side_effect=_fake_imap):
+            items = list(session.iter_items([{"value": 1}], timeout_sec=0.1))
+        assert items[0].result == {"value": 1}
+    finally:
+        session.close()
+
+
+def test_task_pool_map_preserves_none_max_in_flight_for_adaptive_default() -> None:
     from pycloud_parallel import TaskPool
 
     fake_pool = SimpleNamespace(
@@ -870,10 +941,9 @@ def test_task_pool_map_uses_dynamic_default_max_in_flight_by_default() -> None:
         task_method="run",
     )
     try:
-        expected = session._resolve_max_in_flight(None)  # noqa: SLF001
         with patch.object(session, "collect_items", return_value=[]) as mocked_collect:
             session.map([1, 2, 3], arg_name="value", timeout_sec=0.1)
-        assert mocked_collect.call_args.kwargs["max_in_flight"] == expected
+        assert mocked_collect.call_args.kwargs["max_in_flight"] is None
     finally:
         session.close()
 

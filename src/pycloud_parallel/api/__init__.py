@@ -1,5 +1,7 @@
 """V1 public API package target."""
 
+from __future__ import annotations
+
 from .common import DataRef, export
 from .pool import TaskPool
 from .queue import JobQueue

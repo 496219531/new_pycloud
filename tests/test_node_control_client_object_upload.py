@@ -97,6 +97,30 @@ def test_nodecontrol_upgrade_from_wheel_file_invokes_pip(tmp_path, monkeypatch):
     assert calls[1] == ("restart", {})
 
 
+def test_nodecontrol_install_packages_invokes_pip(tmp_path, monkeypatch):
+    server, target, _state = _start_nodecontrol_server("node-install-packages-01", str(tmp_path / "node_install_packages_01"))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.setattr(node_control_http.subprocess, "run", fake_run)
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            result = client.install_packages(
+                requirements=["setuptools==65.5.0"],
+                pip_args=["--index-url=https://example.invalid/simple"],
+            )
+    finally:
+        server.stop()
+
+    assert result["ok"] is True
+    assert calls[0][0][:5] == [node_control_http.sys.executable, "-m", "pip", "install", "--upgrade"]
+    assert "setuptools==65.5.0" in calls[0][0]
+    assert "--index-url=https://example.invalid/simple" in calls[0][0]
+
+
 def test_nodecontrol_restart_node_schedules_restart(tmp_path, monkeypatch):
     server, target, _state = _start_nodecontrol_server("node-restart-01", str(tmp_path / "node_restart_01"))
     calls = []
@@ -150,6 +174,26 @@ def test_nodecontrol_admin_token_update_requires_old_token(tmp_path):
             with pytest.raises(Exception):
                 client.set_admin_token(admin_token="admin-b", old_admin_token="wrong")
             result = client.set_admin_token(admin_token="admin-b", old_admin_token="admin-a")
+
+        assert result["ok"] is True
+        assert result["updated"] is True
+        assert (state.artifact_dir / "admin_token").read_text(encoding="utf-8").strip() == "admin-b"
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_nodecontrol_admin_token_update_accepts_recent_old_token_window(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-admin-token-window", str(tmp_path / "node_admin_token_window"))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            assert client.set_admin_token(admin_token="admin-a")["ok"] is True
+            with pytest.raises(Exception):
+                client.set_admin_token(admin_token="admin-b", old_admin_tokens=["stale-1", "stale-2"])
+            result = client.set_admin_token(
+                admin_token="admin-b",
+                old_admin_tokens=["stale-1", "admin-a", "stale-2"],
+            )
 
         assert result["ok"] is True
         assert result["updated"] is True

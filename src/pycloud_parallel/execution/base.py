@@ -26,6 +26,7 @@ from pycloud_parallel.controlplane.session_model import (
 from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_terminal_heartbeat_error
 from pycloud_parallel.execution.recovery_state import ReplicaRecoveryState, build_replica_recovery_state
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.runtime.executors import _shutdown_executor
 
 
 logger = logging.getLogger(__name__)
@@ -1338,7 +1339,7 @@ class ExecutionSessionBase:
             executor = self._compensation_executor
             self._compensation_executor = None
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            _shutdown_executor(executor, wait=False, cancel_futures=True)
 
     def _sync_failures_from_replicas(self) -> None:
         for node_id, replica in self.replicas.items():

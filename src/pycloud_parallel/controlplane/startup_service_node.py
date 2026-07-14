@@ -528,6 +528,20 @@ class StartupServiceNode(NodeControlState):
             *NodeControlState.service_report_payloads(self, include_stopped=include_stopped),
         ]
 
+    def _close_infocenter_registration_first(self) -> None:
+        self._closed.set()
+        registrar = getattr(self, "_infocenter_registrar", None)
+        if registrar is None:
+            return
+        heartbeat_once = getattr(registrar, "_heartbeat_once", None)
+        if callable(heartbeat_once):
+            with contextlib.suppress(Exception):
+                heartbeat_once(force_inventory=True)
+        with contextlib.suppress(Exception):
+            registrar.close(mark_lost=False)
+        if getattr(self, "_infocenter_registrar", None) is registrar:
+            self._infocenter_registrar = None
+
     def registrar_snapshot(
         self,
         *,
@@ -612,12 +626,15 @@ class StartupServiceNode(NodeControlState):
         return None
 
     def close(self) -> None:
+        self._close_infocenter_registration_first()
         if self._local_ipc_server is not None:
             with contextlib.suppress(Exception):
                 self._local_ipc_server.close()
             self._local_ipc_server = None
-        NodeControlState.close(self)
-        NodeRuntimeBase.close(self)
+        with contextlib.suppress(Exception):
+            NodeControlState.close(self)
+        with contextlib.suppress(Exception):
+            NodeRuntimeBase.close(self)
 
     def create_service(self, *args: Any, **kwargs: Any):
         del args, kwargs

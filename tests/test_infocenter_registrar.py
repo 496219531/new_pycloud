@@ -987,6 +987,53 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
     assert "run: missing_module=pool_missing_pkg" in raw
 
 
+def test_ops_page_shows_service_and_taskpool_deployed_at_by_default():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    deployed_at = datetime(2026, 6, 18, 10, 15, 30, tzinfo=timezone.utc)
+    info_state.register_node_record(
+        node_instance_id="node-deployed-at-1",
+        node_id="node-deployed-at",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-deployed-at": NodeServiceState(
+                service_name="svc-deployed-at",
+                service_id="svc-deployed-at",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                created_at=deployed_at,
+                http_base_url="http://127.0.0.1:18081/svc/svc-deployed-at",
+            )
+        },
+        task_pools={
+            "pool-deployed-at": NodeTaskPoolInfo(
+                pool_id="pool-deployed-at",
+                owner_client_id="owner-1",
+                pool_name="pool-deployed-at",
+                code_version="sha256:test",
+                status="RUNNING",
+                worker_count=2,
+                alive_workers=2,
+                created_at=deployed_at,
+            )
+        },
+    )
+
+    raw = _render_ops_page(info_state)
+
+    assert raw.count("deployed_at") >= 2
+    assert raw.count("2026-06-18T10:15:30+00:00") >= 2
+    assert "ops-table--services :is(th,td):nth-child(n+16):nth-child(-n+18)" in raw
+    assert "ops-table--services :is(th,td):nth-child(20)" in raw
+    assert "ops-table--services :is(th,td):nth-child(n+16):nth-child(-n+20)" not in raw
+    assert "ops-table--pools :is(th,td):nth-child(n+17):nth-child(-n+23)" in raw
+    assert "ops-table--pools :is(th,td):nth-child(n+25):nth-child(-n+27)" in raw
+    assert "ops-table--pools :is(th,td):nth-child(n+17):nth-child(-n+27)" not in raw
+
+
 def test_ops_page_does_not_treat_scheduled_reset_history_as_current_service_failure():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     failure_at = datetime(2026, 6, 13, 15, 34, 15, tzinfo=timezone.utc)

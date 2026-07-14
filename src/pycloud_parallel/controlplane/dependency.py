@@ -7,6 +7,8 @@
 3. 第三方依赖不自动打包，建议显式使用 dependency_allowlist
 """
 
+from __future__ import annotations
+
 import ast
 import gzip
 import hashlib

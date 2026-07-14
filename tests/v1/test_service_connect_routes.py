@@ -150,6 +150,33 @@ def test_service_connect_discovery_retries_briefly_when_routes_are_not_ready():
         client.close()
 
 
+def test_service_connect_discovery_empty_route_details_do_not_recurse():
+    with (
+        patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[]),
+        patch.object(
+            DiscoveryServiceClient,
+            "get_status",
+            return_value={"ok": True, "route_count": 1, "routes": []},
+        ),
+        patch(
+            "pycloud_parallel.execution.service_session._ConnectedService._discover_routes_from_nodes",
+            side_effect=AssertionError("policy refresh should not rediscover routes"),
+        ),
+    ):
+        client = Service.connect(
+            target="127.0.0.1:50051",
+            service_name="svc-demo",
+            route="discovery",
+            timeout_sec=1.0,
+            validate_on_init=True,
+        )
+    try:
+        assert client.effective_policy is None
+        assert client.serialization_mode == ""
+    finally:
+        client.close()
+
+
 def test_service_connect_inherits_deploy_bound_policy_from_routes():
     capability = NodeCapability(
         supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"),

@@ -52,6 +52,7 @@ from pycloud_parallel.controlplane.node.execution import (
 from pycloud_parallel.execution.task_pool import TaskPool
 from pycloud_parallel.execution.support import _retry_infocenter_request
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.runtime.executors import _shutdown_executor
 
 logger = logging.getLogger(__name__)
 
@@ -821,7 +822,7 @@ class JobQueueManager:
             self._submit_executor_close(shared_executor)
         for state in release_states:
             self._release_job_refs(state)
-        self._maintenance_executor.shutdown(wait=True, cancel_futures=True)
+        _shutdown_executor(self._maintenance_executor, wait=True, cancel_futures=True)
 
     def _resolve_requested_task_mode(self, payload: Dict[str, object]) -> str:
         requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()

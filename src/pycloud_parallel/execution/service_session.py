@@ -137,6 +137,7 @@ from pycloud_parallel.execution.support import (
 )
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
+from pycloud_parallel.runtime.executors import _shutdown_executor
 
 logger = logging.getLogger(__name__)
 
@@ -939,7 +940,7 @@ class _ConnectedService:
     def close(self) -> None:
         if self._async_call_executor is not None:
             with contextlib.suppress(Exception):
-                self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._async_call_executor, wait=False, cancel_futures=True)
             self._async_call_executor = None
             self._async_call_executor_capacity = 0
         close = getattr(self._transport_client, "close", None)
@@ -1028,13 +1029,8 @@ class _ConnectedService:
             return
         candidates = list(routes or [])
         if not candidates:
-            try:
-                if self.route == "discovery":
-                    candidates = list(self._discoverable_routes(force_refresh=False))
-                elif isinstance(self._last_status, dict):
-                    candidates = list(self._last_status.get("routes", []) or [])
-            except Exception:
-                candidates = []
+            if isinstance(self._last_status, dict):
+                candidates = list(self._last_status.get("routes", []) or [])
         if not candidates:
             return
         bound_policy_id = _resolve_bound_service_policy_id(
@@ -1264,8 +1260,9 @@ class _ConnectedService:
                 for route in routes
                 if not dependency_method_blocked(getattr(route, "method_failures", {}), method=normalized_method)
             ]
-        self._refresh_effective_policy_from_routes(routes)
-        self._emit_route_notice_once(routes)
+        if routes:
+            self._refresh_effective_policy_from_routes(routes)
+            self._emit_route_notice_once(routes)
         return routes
 
     def _discover_routes_from_nodes(self) -> List[InfoCenterServiceRoute]:
@@ -1370,7 +1367,7 @@ class _ConnectedService:
         ):
             if current_executor is not None:
                 with contextlib.suppress(Exception):
-                    current_executor.shutdown(wait=False, cancel_futures=True)
+                    _shutdown_executor(current_executor, wait=False, cancel_futures=True)
             self._async_call_executor = ThreadPoolExecutor(
                 max_workers=capacity,
                 thread_name_prefix="service-call",
@@ -5157,7 +5154,7 @@ class Service(ServiceExecutionSession):
         ):
             if self._async_call_executor is not None:
                 with contextlib.suppress(Exception):
-                    self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+                    _shutdown_executor(self._async_call_executor, wait=False, cancel_futures=True)
             self._async_call_executor = ThreadPoolExecutor(
                 max_workers=capacity,
                 thread_name_prefix="service-call",
@@ -5681,12 +5678,12 @@ class Service(ServiceExecutionSession):
         self._stop_keepalive()
         if self._async_call_executor is not None:
             with contextlib.suppress(Exception):
-                self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._async_call_executor, wait=False, cancel_futures=True)
             self._async_call_executor = None
             self._async_call_executor_capacity = 0
         if self._async_globals_executor is not None:
             with contextlib.suppress(Exception):
-                self._async_globals_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._async_globals_executor, wait=False, cancel_futures=True)
             self._async_globals_executor = None
             self._async_globals_future = None
         if end_services:

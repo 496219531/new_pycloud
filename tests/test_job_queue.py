@@ -21,6 +21,7 @@ from pycloud_parallel.controlplane.job_orchestrator import (
     JobOrchestratorServer,
 )
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
 from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.data.ref import DataRef, data_ref_to_payload, maybe_data_ref
@@ -324,6 +325,37 @@ def test_startup_service_node_infocenter_registration_is_background(monkeypatch)
     node.start_infocenter_registration(infocenter_target="http://127.0.0.1:9", heartbeat_sec=1)
 
     assert [name for name, _payload in events] == ["init", "start"]
+
+
+def test_startup_service_node_close_unregisters_before_local_cleanup(monkeypatch) -> None:
+    events = []
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+
+    class _FakeRegistrar:
+        def _heartbeat_once(self, *, force_inventory=False):
+            events.append(("heartbeat", force_inventory, node.registrar_snapshot()["service_reports"]))
+
+        def close(self, *, mark_lost=True):
+            events.append(("registrar-close", mark_lost))
+
+    node._infocenter_registrar = _FakeRegistrar()  # noqa: SLF001
+
+    def _fail_local_cleanup(self):
+        events.append(("nodecontrol-close", None))
+        raise RuntimeError("local cleanup failed")
+
+    monkeypatch.setattr(NodeControlState, "close", _fail_local_cleanup)
+    monkeypatch.setattr(NodeRuntimeBase, "close", lambda self: events.append(("runtime-close", None)))
+
+    node.close()
+
+    assert events == [
+        ("heartbeat", True, []),
+        ("registrar-close", False),
+        ("nodecontrol-close", None),
+        ("runtime-close", None),
+    ]
+    assert node._infocenter_registrar is None  # noqa: SLF001
 
 
 def test_nodecontrol_and_job_orchestrator_start_uses_service_startup(monkeypatch) -> None:

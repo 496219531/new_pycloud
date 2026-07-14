@@ -8,7 +8,7 @@ import threading
 import traceback
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 from .client_transport import (
@@ -38,7 +38,7 @@ InvokeHandler = Callable[
 ]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
 MethodsHandler = Callable[[str, bool], Tuple[int, Dict[str, object]]]
-ExtraGetHandler = Callable[[str, list[str], Dict[str, list[str]]], Optional[Tuple[Any, ...]]]
+ExtraGetHandler = Callable[[str, List[str], Dict[str, List[str]]], Optional[Tuple[Any, ...]]]
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:

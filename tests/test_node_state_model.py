@@ -777,6 +777,62 @@ def test_nodecontrol_task_pool_create_signals_and_heartbeat_stays_lightweight(tm
         state.close()
 
 
+def test_nodecontrol_service_report_payload_includes_created_at(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-report-created-at",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_report_created_at"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    created_at = datetime(2026, 6, 18, 9, 30, 0, tzinfo=timezone.utc)
+    current_time = {"value": created_at}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            return None
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service-report-created-at",
+            service_name="svc-report-created-at",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_report_created_at",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        payloads = state.service_report_payloads(include_stopped=True)
+
+        assert payloads[0]["service_id"] == session.service_id
+        assert payloads[0]["created_at"] == created_at.isoformat()
+    finally:
+        state.close()
+
+
 def test_nodecontrol_sync_task_pool_create_lease_starts_when_ready(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-pool-ready-lease",

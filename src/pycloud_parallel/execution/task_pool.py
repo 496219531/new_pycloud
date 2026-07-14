@@ -105,6 +105,7 @@ from pycloud_parallel.execution.support import (
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref, normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.runtime.executors import _shutdown_executor
 
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,11 @@ def _resolve_owner_api_token(api_token: str = "") -> str:
     return str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
 _TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
 _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
+_ADAPTIVE_INFLIGHT_TARGET_BACKLOG_SEC = 60.0
+_ADAPTIVE_INFLIGHT_EMA_ALPHA = 0.2
+_ADAPTIVE_INFLIGHT_MAX_WORKER_FACTOR = 8
+_ADAPTIVE_INFLIGHT_LOG_INTERVAL_SEC = 30.0
+_ADAPTIVE_INFLIGHT_LOG_CHANGE_RATIO = 0.25
 
 
 def _emit_taskpool_notice(message: str) -> None:
@@ -131,6 +137,98 @@ def _emit_taskpool_notice(message: str) -> None:
     if not text:
         return
     print(f"[TaskPool] {text}", file=sys.stderr, flush=True)
+
+
+class _AdaptiveInflightController:
+    def __init__(
+        self,
+        *,
+        active_workers: int,
+        initial_window: int,
+        target_backlog_sec: float = _ADAPTIVE_INFLIGHT_TARGET_BACKLOG_SEC,
+        ema_alpha: float = _ADAPTIVE_INFLIGHT_EMA_ALPHA,
+        max_window: Optional[int] = None,
+    ) -> None:
+        workers = max(1, int(active_workers or 1))
+        self.min_window = workers
+        start = max(self.min_window, int(initial_window or self.min_window))
+        upper = int(max_window) if max_window is not None else max(start, workers * _ADAPTIVE_INFLIGHT_MAX_WORKER_FACTOR)
+        self.max_window = max(start, upper)
+        self.window = min(self.max_window, start)
+        self.target_backlog_sec = max(1.0, float(target_backlog_sec or _ADAPTIVE_INFLIGHT_TARGET_BACKLOG_SEC))
+        self.ema_alpha = min(1.0, max(0.01, float(ema_alpha or _ADAPTIVE_INFLIGHT_EMA_ALPHA)))
+        self.ema_result_interval_sec: Optional[float] = None
+        self.last_result_at: Optional[float] = None
+        self.last_log_at: float = 0.0
+        self.last_logged_window = self.window
+
+    def observe_result_batch(self, *, count: int, now: Optional[float] = None) -> bool:
+        normalized_count = max(0, int(count or 0))
+        if normalized_count <= 0:
+            return False
+        observed_at = time.time() if now is None else float(now)
+        if self.last_result_at is None:
+            self.last_result_at = observed_at
+            return False
+        elapsed = max(0.001, observed_at - self.last_result_at)
+        self.last_result_at = observed_at
+        interval = max(0.001, elapsed / float(normalized_count))
+        if self.ema_result_interval_sec is None:
+            self.ema_result_interval_sec = interval
+        else:
+            alpha = self.ema_alpha
+            self.ema_result_interval_sec = (alpha * interval) + ((1.0 - alpha) * self.ema_result_interval_sec)
+        target = self._target_window()
+        return self._move_toward(target)
+
+    def on_timeout(self) -> bool:
+        old = self.window
+        self.window = max(self.min_window, int(math.ceil(float(self.window) * 0.5)))
+        return self.window != old
+
+    def maybe_log(self, *, pool_name: str, job_id: str, reason: str, now: Optional[float] = None) -> None:
+        observed_at = time.time() if now is None else float(now)
+        old_logged = max(1, int(self.last_logged_window or 1))
+        change_ratio = abs(float(self.window - old_logged)) / float(old_logged)
+        if (
+            observed_at - self.last_log_at < _ADAPTIVE_INFLIGHT_LOG_INTERVAL_SEC
+            and change_ratio < _ADAPTIVE_INFLIGHT_LOG_CHANGE_RATIO
+        ):
+            return
+        self.last_log_at = observed_at
+        self.last_logged_window = self.window
+        logger.info(
+            "taskpool adaptive inflight window pool_name=%s job_id=%s reason=%s window=%s "
+            "min_window=%s max_window=%s target_window=%s ema_result_interval_sec=%s target_backlog_sec=%.3f",
+            pool_name,
+            job_id,
+            reason,
+            self.window,
+            self.min_window,
+            self.max_window,
+            self._target_window(),
+            None if self.ema_result_interval_sec is None else round(float(self.ema_result_interval_sec), 6),
+            self.target_backlog_sec,
+        )
+
+    def _target_window(self) -> int:
+        interval = self.ema_result_interval_sec
+        if interval is None:
+            return int(self.window)
+        raw = int(round(self.target_backlog_sec / max(0.001, float(interval))))
+        return min(self.max_window, max(self.min_window, raw))
+
+    def _move_toward(self, target: int) -> bool:
+        old = self.window
+        if target == old:
+            return False
+        smoothed = int(round((0.7 * float(old)) + (0.3 * float(target))))
+        if target > old:
+            self.window = min(target, max(old + 1, smoothed))
+        else:
+            self.window = max(target, min(old - 1, smoothed))
+        self.window = min(self.max_window, max(self.min_window, int(self.window)))
+        return self.window != old
 
 
 def _format_pool_route_summary(routes: Sequence[Dict[str, object]]) -> str:
@@ -655,7 +753,7 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
             self._lock.notify_all()
         for future in futures:
             future.cancel()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        _shutdown_executor(self._executor, wait=False, cancel_futures=True)
 
     def upload_object_from_bytes(
         self,
@@ -2731,7 +2829,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             )
             return
         normalized_payloads = self._merge_payloads_with_shared_kwargs(payloads, shared_kwargs=dict(shared_kwargs))
-        resolved_max_in_flight = self._resolve_max_in_flight(max_in_flight)
+        receive_batch_limit = self._resolve_max_in_flight(max_in_flight)
         progress_kwargs = {}
         if progress:
             progress_kwargs["progress"] = progress
@@ -2740,8 +2838,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             normalized_payloads,
             task_method=task_method,
             strategy=strategy,
-            max_in_flight=resolved_max_in_flight,
-            receive_batch=max(1, min(resolved_max_in_flight, 32)),
+            max_in_flight=max_in_flight,
+            receive_batch=max(1, min(receive_batch_limit, 32)),
             submit_timeout_sec=max(0.1, float(timeout_sec)),
             result_timeout_sec=max(0.1, float(timeout_sec)),
             server_wait_ms=effective_wait_ms,
@@ -3625,6 +3723,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         )
         try:
             self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
+            adaptive_inflight = max_in_flight is None
             max_pending = self._resolve_max_in_flight(max_in_flight)
             max_receive = max(1, int(receive_batch or 1))
             submit_timeout_sec = float(submit_timeout_sec if submit_timeout_sec is not None else timeout_sec)
@@ -3640,6 +3739,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             node_ids = self._available_pool_node_ids()
             if not node_ids:
                 raise RuntimeError("task pool has no active node pools")
+            adaptive_controller: Optional[_AdaptiveInflightController] = None
+            pool_name_for_log = str(getattr(next(iter(self._pools.values()), None), "pool_name", "") or "")
+            if adaptive_inflight:
+                adaptive_controller = _AdaptiveInflightController(
+                    active_workers=self._effective_worker_count(),
+                    initial_window=max_pending,
+                )
+                max_pending = adaptive_controller.window
             inflight_by_node = {node_id: 0 for node_id in node_ids}
             disabled_submit_nodes: set[str] = set()
             scheduler_failures: Dict[str, str] = {}
@@ -3657,8 +3764,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 force=True,
             )
 
+            max_pending = adaptive_controller.window if adaptive_controller is not None else max_pending
             initial_quota = {node_id: max_pending for node_id in node_ids}
-            self._fill_imap_from_quota(
+            initial_submitted = self._fill_imap_from_quota(
                 initial_quota,
                 node_order=node_ids,
                 max_pending=max_pending,
@@ -3671,6 +3779,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 task_index_by_id=task_index_by_id,
                 scheduler_failures=scheduler_failures,
             )
+            if adaptive_controller is not None and initial_submitted > 0:
+                adaptive_controller.last_result_at = time.time()
             submitted = payload_buffer.submitted_count
             reporter.emit(
                 phase="running",
@@ -3747,6 +3857,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     return
 
                 if self._pending_result_count() <= 0:
+                    max_pending = adaptive_controller.window if adaptive_controller is not None else max_pending
                     idle_quota = {node_id: max_pending for node_id in node_ids}
                     submitted_now = self._fill_imap_from_quota(
                         idle_quota,
@@ -3813,9 +3924,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 if completed_items:
                     wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
                     ready_items.extend(completed_items)
+                    if adaptive_controller is not None:
+                        changed = adaptive_controller.observe_result_batch(count=len(completed_items))
+                        max_pending = adaptive_controller.window
+                        if changed:
+                            adaptive_controller.maybe_log(
+                                pool_name=pool_name_for_log,
+                                job_id=self.job_id,
+                                reason="result_interval",
+                            )
                     if not (raise_on_error and any(not item.ok for item in completed_items)):
                         freed_total = max(0, sum(int(value or 0) for value in freed_by_node.values()))
                         if freed_total > 0:
+                            max_pending = adaptive_controller.window if adaptive_controller is not None else max_pending
                             refill_quota = {node_id: freed_total for node_id in node_ids}
                             self._fill_imap_from_quota(
                                 refill_quota,
@@ -3849,6 +3970,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     )
                     if pending_by_node:
                         last_error += f"; pending_by_node={pending_by_node}"
+                    if adaptive_controller is not None:
+                        changed = adaptive_controller.on_timeout()
+                        max_pending = adaptive_controller.window
+                        if changed:
+                            adaptive_controller.maybe_log(
+                                pool_name=pool_name_for_log,
+                                job_id=self.job_id,
+                                reason="timeout",
+                            )
                     stalled_node_ids = [
                         node_id
                         for node_id in node_ids
@@ -4080,7 +4210,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             payloads,
             task_method=task_method,
             strategy=strategy,
-            max_in_flight=self._resolve_max_in_flight(max_in_flight),
+            max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
             **progress_kwargs,
         )
@@ -4272,7 +4402,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._stop_keepalive()
         if self._async_globals_executor is not None:
             with contextlib.suppress(Exception):
-                self._async_globals_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._async_globals_executor, wait=False, cancel_futures=True)
             self._async_globals_executor = None
             self._async_globals_future = None
         close_reason = str(reason or "task pool session close")

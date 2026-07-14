@@ -426,6 +426,9 @@ class NodeControlHttpApp:
             if parts == ["admin", "upgrade"]:
                 payload = _read_json(body)
                 return self._upgrade_node(payload)
+            if parts == ["admin", "packages", "install"]:
+                payload = _read_json(body)
+                return self._install_packages(payload)
             if parts == ["admin", "restart"]:
                 payload = _read_json(body)
                 return self._restart_node(payload)
@@ -508,6 +511,61 @@ class NodeControlHttpApp:
             _restart_current_process_delayed()
         return self._ok(data)
 
+    def _install_packages(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        raw_requirements = payload.get("requirements") or []
+        if isinstance(raw_requirements, str):
+            raw_requirements = [raw_requirements]
+        if not isinstance(raw_requirements, list):
+            return self._err(400, "requirements must be a list")
+        requirements = [str(item).strip() for item in raw_requirements if str(item).strip()]
+        if not requirements:
+            return self._err(400, "requirements must not be empty")
+        pip_args = payload.get("pip_args") or []
+        if not isinstance(pip_args, list):
+            return self._err(400, "pip_args must be a list")
+        safe_pip_args = [str(arg) for arg in pip_args if str(arg).strip()]
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            *requirements,
+            *safe_pip_args,
+        ]
+        started_at = time.time()
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(Path.cwd()),
+                capture_output=True,
+                text=True,
+                timeout=max(30.0, float(payload.get("timeout_sec", 300.0) or 300.0)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            data = {
+                "ok": False,
+                "returncode": None,
+                "cmd": cmd,
+                "duration_sec": round(time.time() - started_at, 3),
+                "stdout": str(exc.stdout or "")[-4000:],
+                "stderr": str(exc.stderr or "")[-4000:],
+                "error": "pip install timed out",
+            }
+            return 500, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes(data)
+        data = {
+            "ok": completed.returncode == 0,
+            "returncode": int(completed.returncode),
+            "cmd": cmd,
+            "duration_sec": round(time.time() - started_at, 3),
+            "stdout": (completed.stdout or "")[-4000:],
+            "stderr": (completed.stderr or "")[-4000:],
+        }
+        if completed.returncode != 0:
+            data["error"] = "pip install failed"
+            return 500, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes(data)
+        return self._ok(data)
+
     def _restart_node(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         delay_sec = max(0.1, float(payload.get("delay_sec", 1.0) or 1.0))
         _restart_current_process_delayed(delay_sec=delay_sec)
@@ -515,15 +573,23 @@ class NodeControlHttpApp:
 
     def _set_admin_token(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         new_token = str(payload.get("admin_token", "") or "").strip()
-        old_token = str(payload.get("old_admin_token", "") or "").strip()
+        raw_old_tokens = payload.get("old_admin_tokens") or []
+        if isinstance(raw_old_tokens, str):
+            raw_old_tokens = [raw_old_tokens]
+        if not isinstance(raw_old_tokens, list):
+            return self._err(400, "old_admin_tokens must be a list")
+        old_tokens = [str(item).strip() for item in raw_old_tokens if str(item).strip()]
+        legacy_old_token = str(payload.get("old_admin_token", "") or "").strip()
+        if legacy_old_token:
+            old_tokens.append(legacy_old_token)
         if not new_token:
             return self._err(400, "admin_token is required")
         current = self._configured_admin_token()
         if current:
-            if not old_token:
-                return self._err(401, "old_admin_token is required to update admin token")
-            if not secrets.compare_digest(old_token, current):
-                return self._err(403, "invalid old_admin_token")
+            if not old_tokens:
+                return self._err(401, "old_admin_tokens is required to update admin token")
+            if not any(secrets.compare_digest(old_token, current) for old_token in old_tokens):
+                return self._err(403, "invalid old_admin_tokens")
         self._write_admin_token(new_token)
         return self._ok({"ok": True, "admin_token_configured": True, "updated": bool(current)})
 
@@ -1308,6 +1374,27 @@ class HttpNodeControlClient:
             api_token=api_token,
         )
 
+    def install_packages(
+        self,
+        *,
+        requirements: Sequence[str],
+        pip_args: Optional[Sequence[str]] = None,
+        timeout_sec: float = 300.0,
+        api_token: str = "",
+    ) -> Dict[str, object]:
+        payload = {
+            "requirements": [str(item) for item in requirements if str(item).strip()],
+            "pip_args": [str(arg) for arg in (pip_args or ()) if str(arg).strip()],
+            "timeout_sec": max(30.0, float(timeout_sec or 300.0)),
+        }
+        return self._json(
+            "POST",
+            "/admin/packages/install",
+            payload,
+            timeout_sec=max(self.timeout_sec, float(timeout_sec or 300.0) + 5.0),
+            headers=self._api_headers(api_token),
+        )
+
     def restart_node(self, *, delay_sec: float = 1.0, api_token: str = "") -> Dict[str, object]:
         return self._json(
             "POST",
@@ -1316,13 +1403,24 @@ class HttpNodeControlClient:
             headers=self._api_headers(api_token),
         )
 
-    def set_admin_token(self, *, admin_token: str, old_admin_token: str = "") -> Dict[str, object]:
+    def set_admin_token(
+        self,
+        *,
+        admin_token: str,
+        old_admin_token: str = "",
+        old_admin_tokens: Optional[Sequence[str]] = None,
+    ) -> Dict[str, object]:
+        token_candidates = [str(item).strip() for item in (old_admin_tokens or ()) if str(item).strip()]
+        legacy_old_token = str(old_admin_token or "").strip()
+        if legacy_old_token:
+            token_candidates.append(legacy_old_token)
         return self._json(
             "POST",
             "/admin/token",
             {
                 "admin_token": str(admin_token or "").strip(),
-                "old_admin_token": str(old_admin_token or "").strip(),
+                "old_admin_token": legacy_old_token,
+                "old_admin_tokens": token_candidates,
             },
         )
 

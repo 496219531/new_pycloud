@@ -263,6 +263,8 @@ class InfoCenterState:
         for service_id, svc in incoming_services.items():
             reason = str(getattr(svc, "stop_reason", "") or "").strip()
             previous = previous_services.get(service_id)
+            if getattr(svc, "created_at", None) is None and previous is not None:
+                svc.created_at = getattr(previous, "created_at", None)
             previous_reason = str(getattr(previous, "stop_reason", "") or "").strip() if previous is not None else ""
             failure_at = getattr(svc, "failure_at", None)
             if reason:

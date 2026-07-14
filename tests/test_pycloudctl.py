@@ -115,6 +115,27 @@ def test_ctl_parser_accepts_upgrade_nodes_command(tmp_path):
     assert args.restart is True
 
 
+def test_ctl_parser_accepts_install_node_packages_command():
+    parser = ctl.build_parser()
+
+    args = parser.parse_args([
+        "install-node-packages",
+        "--target",
+        "10.0.0.1:50051",
+        "--node-ids",
+        "node-a",
+        "--requirement",
+        "setuptools==65.5.0",
+        "--restart",
+    ])
+
+    assert args.command == "install-node-packages"
+    assert args.target == "10.0.0.1:50051"
+    assert args.node_ids == "node-a"
+    assert args.requirement == ["setuptools==65.5.0"]
+    assert args.restart is True
+
+
 def test_ctl_parser_accepts_admin_token_command():
     parser = ctl.build_parser()
 
@@ -133,12 +154,28 @@ def test_cmd_admin_token_generate_only(tmp_path, monkeypatch, capsys):
 
     assert ctl._cmd_admin_token(args) == 0
     assert capsys.readouterr().out.strip() == "generated-token"
-    assert (tmp_path / "admin_token").read_text(encoding="utf-8").strip() == "generated-token"
+    assert json.loads((tmp_path / "admin_token").read_text(encoding="utf-8")) == {
+        "current_token": "generated-token",
+        "previous_tokens": [],
+    }
+
+
+def test_local_admin_token_window_preserves_previous_two(tmp_path):
+    (tmp_path / "admin_token").write_text("legacy-current\n", encoding="utf-8")
+    assert ctl._load_local_admin_token_window(tmp_path) == ("legacy-current", [])
+
+    ctl._write_local_admin_token_window(tmp_path, "token-new", ["legacy-current", "prev-1", "prev-2"])
+
+    assert ctl._load_local_admin_token_window(tmp_path) == ("token-new", ["legacy-current", "prev-1"])
+    assert ctl._load_local_admin_token(tmp_path) == "token-new"
 
 
 def test_cmd_admin_token_sets_selected_nodes(tmp_path, monkeypatch):
     calls = []
-    (tmp_path / "admin_token").write_text("old-local\n", encoding="utf-8")
+    (tmp_path / "admin_token").write_text(
+        json.dumps({"current_token": "old-local", "previous_tokens": ["prev-1", "prev-2"]}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(ctl, "_ensure_controlplane_host_command_allowed", lambda *_args, **_kwargs: None)
 
     class FakeInfoCenterClient:
@@ -180,11 +217,74 @@ def test_cmd_admin_token_sets_selected_nodes(tmp_path, monkeypatch):
 
     assert ctl._cmd_admin_token(args) == 0
     assert calls[0] == ("infocenter", "10.0.0.1:50051", 30.0)
-    assert [item for item in calls if item[0] == "nodeclient"] == [("nodeclient", "http://10.0.0.2:50061")]
-    assert [item for item in calls if item[0] == "set_admin_token"] == [
-        ("set_admin_token", "http://10.0.0.2:50061", {"admin_token": "new", "old_admin_token": "old-local"})
+    assert [item for item in calls if item[0] == "nodeclient"] == [
+        ("nodeclient", "http://10.0.0.2:50061"),
+        ("nodeclient", "http://10.0.0.2:50062"),
     ]
-    assert (tmp_path / "admin_token").read_text(encoding="utf-8").strip() == "new"
+    assert [item for item in calls if item[0] == "set_admin_token"] == [
+        (
+            "set_admin_token",
+            "http://10.0.0.2:50061",
+            {"admin_token": "new", "old_admin_tokens": ["old-local", "prev-1", "prev-2"]},
+        ),
+        (
+            "set_admin_token",
+            "http://10.0.0.2:50062",
+            {"admin_token": "new", "old_admin_tokens": ["old-local", "prev-1", "prev-2"]},
+        ),
+    ]
+    assert json.loads((tmp_path / "admin_token").read_text(encoding="utf-8")) == {
+        "current_token": "new",
+        "previous_tokens": ["old-local", "prev-1"],
+    }
+
+
+def test_cmd_admin_token_persists_generated_token_after_partial_success(tmp_path, monkeypatch):
+    calls = []
+    (tmp_path / "admin_token").write_text("old-local\n", encoding="utf-8")
+    monkeypatch.setattr(ctl, "_generate_admin_token", lambda: "generated-token")
+    monkeypatch.setattr(ctl, "_ensure_controlplane_host_command_allowed", lambda *_args, **_kwargs: None)
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061"),
+                SimpleNamespace(node_id="node-b", node_instance_id="node-b-inst", control_addr="http://10.0.0.3:50061"),
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def set_admin_token(self, **_kwargs):
+            calls.append(self.target)
+            if self.target.endswith("10.0.0.3:50061"):
+                raise RuntimeError("node unavailable")
+            return {"ok": True, "updated": True}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "admin-token", "--target", "10.0.0.1:50051"])
+
+    assert ctl._cmd_admin_token(args) == 1
+    assert calls == ["http://10.0.0.2:50061", "http://10.0.0.3:50061"]
+    assert ctl._load_local_admin_token_window(tmp_path) == ("generated-token", ["old-local"])
 
 
 def test_cmd_admin_token_requires_controlplane_host_by_default(monkeypatch):
@@ -249,6 +349,123 @@ def test_cmd_upgrade_nodes_uses_infocenter_and_node_clients(tmp_path, monkeypatc
     assert calls[3][1]["wheel_name"] == wheel.name
     assert calls[3][1]["wheel_bytes"] == b"wheel"
     assert calls[3][1]["restart"] is True
+
+
+def test_cmd_install_node_packages_uses_infocenter_and_node_clients(tmp_path, monkeypatch):
+    calls = []
+    (tmp_path / "admin_token").write_text("admin-token-a\n", encoding="utf-8")
+
+    class FakeInfoCenterClient:
+        def __init__(self, target, *, timeout_sec=10.0):
+            calls.append(("infocenter", target, timeout_sec))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **kwargs):
+            calls.append(("list_nodes", kwargs))
+            return [
+                SimpleNamespace(
+                    node_id="node-a",
+                    node_instance_id="node-a-inst",
+                    control_addr="http://10.0.0.2:50061",
+                )
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, *, timeout_sec=10.0, api_token=""):
+            calls.append(("nodeclient", target, timeout_sec, api_token))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def install_packages(self, **kwargs):
+            calls.append(("install_packages", kwargs))
+            return {"ok": True, "returncode": 0}
+
+        def restart_node(self, **kwargs):
+            calls.append(("restart_node", kwargs))
+            return {"ok": True, "restart_scheduled": True}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "install-node-packages",
+        "--target",
+        "10.0.0.1:50051",
+        "--node-ids",
+        "node-a",
+        "--requirement",
+        "setuptools==65.5.0",
+        "--pip-arg=--index-url=https://example.invalid/simple",
+        "--restart",
+    ])
+
+    assert ctl._cmd_install_node_packages(args) == 0
+    assert calls[0] == ("infocenter", "10.0.0.1:50051", 300.0)
+    assert calls[1][0] == "list_nodes"
+    assert calls[1][1]["node_ids"] == ["node-a"]
+    assert calls[2] == ("nodeclient", "http://10.0.0.2:50061", 300.0, "admin-token-a")
+    assert calls[3] == (
+        "install_packages",
+        {
+            "requirements": ["setuptools==65.5.0"],
+            "pip_args": ["--index-url=https://example.invalid/simple"],
+            "timeout_sec": 300.0,
+        },
+    )
+    assert calls[4] == ("nodeclient", "http://10.0.0.2:50061", 300.0, "admin-token-a")
+    assert calls[5] == ("restart_node", {"delay_sec": 1.0, "api_token": "admin-token-a"})
+
+
+def test_cmd_install_node_packages_does_not_restart_duplicate_after_install_failure(monkeypatch):
+    selected = SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061")
+    skipped = {
+        "node_id": "node-b",
+        "node_instance_id": "node-b-inst",
+        "control_addr": "http://10.0.0.2:50062",
+        "host_key": "10.0.0.2",
+        "selected_node_instance_id": "node-a-inst",
+    }
+    monkeypatch.setattr(ctl, "_select_nodecontrol_nodes_for_ctl", lambda *_args: ([selected], [skipped]))
+
+    class FakeNodeControlClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def install_packages(self, **_kwargs):
+            return {"ok": False, "returncode": 1, "error": "install failed"}
+
+        def restart_node(self, **_kwargs):
+            raise AssertionError("duplicate node must not restart after install failure")
+
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "install-node-packages",
+        "--target",
+        "10.0.0.1:50051",
+        "--requirement",
+        "demo-package",
+        "--restart",
+    ])
+
+    assert ctl._cmd_install_node_packages(args) == 1
 
 
 def test_cmd_upgrade_nodes_explicit_admin_token_overrides_local(tmp_path, monkeypatch):
@@ -439,6 +656,42 @@ def test_cmd_upgrade_nodes_restarts_same_host_duplicates_without_reinstall(tmp_p
     assert ctl._cmd_upgrade_nodes(args) == 0
     assert [item for item in calls if item[0] == "upgrade"] == [("upgrade", "http://10.0.0.2:50061")]
     assert [item for item in calls if item[0] == "restart"] == [("restart", "http://10.0.0.2:50062")]
+
+
+def test_cmd_upgrade_nodes_does_not_restart_duplicate_after_upgrade_failure(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    selected = SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061")
+    skipped = {
+        "node_id": "node-b",
+        "node_instance_id": "node-b-inst",
+        "control_addr": "http://10.0.0.2:50062",
+        "host_key": "10.0.0.2",
+        "selected_node_instance_id": "node-a-inst",
+    }
+    monkeypatch.setattr(ctl, "_select_nodecontrol_nodes_for_ctl", lambda *_args: ([selected], [skipped]))
+
+    class FakeNodeControlClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            return {"ok": False, "returncode": 1, "restart_scheduled": False, "error": "upgrade failed"}
+
+        def restart_node(self, **_kwargs):
+            raise AssertionError("duplicate node must not restart after upgrade failure")
+
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel), "--restart"])
+
+    assert ctl._cmd_upgrade_nodes(args) == 1
 
 
 def test_cmd_upgrade_nodes_can_upgrade_every_node_on_same_host(tmp_path, monkeypatch):

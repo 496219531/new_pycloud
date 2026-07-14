@@ -41,6 +41,7 @@ class NodeServiceState:
     returned_count: int = 0
     ema_child_invoke_ms: float = 0.0
     ema_samples: int = 0
+    created_at: Optional[datetime] = None
     lease_expire_at: datetime = field(default_factory=utc_now)
     http_base_url: str = ""
     stop_reason: str = ""

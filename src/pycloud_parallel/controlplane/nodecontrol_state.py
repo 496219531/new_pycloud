@@ -156,6 +156,7 @@ from pycloud_parallel.controlplane.resource_signals import (
 from pycloud_parallel.execution.dependency_failover import dependency_failure_reason, dependency_missing_module
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
+from pycloud_parallel.runtime.executors import _shutdown_executor
 
 
 logger = logging.getLogger(__name__)
@@ -568,8 +569,8 @@ class NodeControlState(NodeRuntimeBase):
         self.stop_service_gateway()
         self._shutdown_all_services()
         self._shutdown_all_task_pools()
-        self._resource_operation_executor.shutdown(wait=False, cancel_futures=True)
-        self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
+        _shutdown_executor(self._resource_operation_executor, wait=False, cancel_futures=True)
+        _shutdown_executor(self._cleanup_executor, wait=False, cancel_futures=True)
         if self._executor_host is not None:
             self._executor_host.close(shutdown_timeout_sec=NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC)
             self._executor_host = None
