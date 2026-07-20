@@ -4274,6 +4274,85 @@ def test_native_task_pool_session_imap_unordered_uses_full_global_max_in_flight(
     assert submit_batch_sizes[0] == 8
 
 
+def test_native_task_pool_session_adaptive_window_increase_submits_to_new_limit() -> None:
+    from pycloud_parallel import TaskPool
+
+    inflight = 0
+    peak_inflight = 0
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self) -> None:
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(
+                fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id}
+            )
+
+        def submit_tasks(self, tasks, job_id=""):
+            nonlocal inflight, peak_inflight
+            inflight += len(tasks)
+            peak_inflight = max(peak_inflight, inflight)
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"task_id": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            nonlocal inflight
+            batch = self._ready[:1]
+            self._ready = self._ready[1:]
+            inflight -= len(batch)
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    class _GrowingController:
+        def __init__(self, **_kwargs) -> None:
+            self.window = 2
+            self.last_result_at = None
+
+        def observe_result_batch(self, *, count: int, now=None) -> bool:
+            self.window = 4
+            return True
+
+        def on_timeout(self) -> bool:
+            return False
+
+        def maybe_log(self, **_kwargs) -> None:
+            return None
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-adaptive-window-growth",
+    )
+
+    with patch("pycloud_parallel.execution.task_pool._AdaptiveInflightController", _GrowingController):
+        items = list(
+            session.imap_unordered(
+                [{"value": idx} for idx in range(8)],
+                receive_batch=1,
+                result_timeout_sec=0.5,
+                wait_ms=1,
+            )
+        )
+
+    assert len(items) == 8
+    assert peak_inflight == 4
+
+
 def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_arrive() -> None:
     from pycloud_parallel import TaskPool
 
