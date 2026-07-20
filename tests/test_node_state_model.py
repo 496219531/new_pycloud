@@ -80,6 +80,42 @@ def _wait_until(predicate, *, timeout_sec: float = 2.0, interval_sec: float = 0.
     return bool(predicate())
 
 
+def test_nodecontrol_dispatcher_continues_after_iteration_failure(tmp_path, monkeypatch, caplog):
+    state = NodeControlState(
+        node_id="node-dispatch-recovery",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "node_dispatch_recovery"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    calls = {"drain": 0, "ensure": 0}
+
+    def _drain():
+        calls["drain"] += 1
+        if calls["drain"] == 1:
+            raise RuntimeError("transient registry race")
+        state._stop_event.set()  # noqa: SLF001
+
+    def _ensure():
+        calls["ensure"] += 1
+        return False
+
+    monkeypatch.setattr(state, "_drain_executor_events", _drain)
+    monkeypatch.setattr(state, "_ensure_executor_host_alive", _ensure)
+    state.executor_poll_interval_sec = 0.001
+    try:
+        with caplog.at_level("ERROR"):
+            state._dispatch_loop()  # noqa: SLF001
+    finally:
+        state.close()
+
+    assert calls == {"drain": 2, "ensure": 1}
+    assert "nodecontrol dispatcher iteration failed" in caplog.text
+    assert "transient registry race" in caplog.text
+
+
 def _object_upload_source_blob(source):
     if source.is_file:
         return Path(source.file_path).read_bytes()

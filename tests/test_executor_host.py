@@ -181,6 +181,24 @@ def test_create_executor_backend_defaults_to_subprocess_host():
         backend.close()
 
 
+def test_executor_backend_is_alive_uses_stable_client_snapshot():
+    backend = SubprocessExecutorBackend(task_worker_capacity=1)
+
+    class _AliveClient:
+        def is_alive(self):
+            return True
+
+    class _MutatingClient:
+        def is_alive(self):
+            backend._service_clients["late-service"] = _AliveClient()  # noqa: SLF001
+            return True
+
+    backend._service_clients["first-service"] = _MutatingClient()  # noqa: SLF001
+
+    assert backend.is_alive() is True
+    assert set(backend._service_clients) == {"first-service", "late-service"}  # noqa: SLF001
+
+
 def test_subprocess_backend_stop_service_accepts_reason_and_reports_liveness():
     calls = []
 

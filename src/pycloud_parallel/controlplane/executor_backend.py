@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Executor backend boundary used by NodeControl."""
 
+import threading
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 from pycloud_parallel.controlplane.executor_host import DEFAULT_EXECUTOR_OPERATION_TIMEOUT_SEC, ExecutorHostClient
@@ -81,93 +82,107 @@ class SubprocessExecutorBackend:
         self._prepare_client: Optional[ExecutorHostClient] = None
         self._service_clients: Dict[str, ExecutorHostClient] = {}
         self._pool_clients: Dict[str, ExecutorHostClient] = {}
+        self._clients_lock = threading.RLock()
         self._closed = False
 
     def _new_client(self) -> ExecutorHostClient:
-        if self._closed:
-            raise RuntimeError("executor backend is closed")
-        return ExecutorHostClient(task_worker_capacity=self._task_worker_capacity)
+        with self._clients_lock:
+            if self._closed:
+                raise RuntimeError("executor backend is closed")
+            return ExecutorHostClient(task_worker_capacity=self._task_worker_capacity)
 
     def _ensure_runtime_client(self) -> ExecutorHostClient:
-        if self._runtime_client is None or not self._runtime_client.is_alive():
-            self._runtime_client = self._new_client()
-        return self._runtime_client
+        with self._clients_lock:
+            if self._runtime_client is None or not self._runtime_client.is_alive():
+                self._runtime_client = self._new_client()
+            return self._runtime_client
 
     def _ensure_prepare_client(self) -> ExecutorHostClient:
-        if self._prepare_client is None or not self._prepare_client.is_alive():
-            self._prepare_client = self._new_client()
-        return self._prepare_client
+        with self._clients_lock:
+            if self._prepare_client is None or not self._prepare_client.is_alive():
+                self._prepare_client = self._new_client()
+            return self._prepare_client
 
     def _ensure_service_client(self, service_id: str) -> ExecutorHostClient:
         key = str(service_id or "").strip()
-        client = self._service_clients.get(key)
-        if client is None or not client.is_alive():
-            client = self._new_client()
-            self._service_clients[key] = client
-        return client
+        with self._clients_lock:
+            client = self._service_clients.get(key)
+            if client is None or not client.is_alive():
+                client = self._new_client()
+                self._service_clients[key] = client
+            return client
 
     def _ensure_pool_client(self, pool_id: str) -> ExecutorHostClient:
         key = str(pool_id or "").strip()
-        client = self._pool_clients.get(key)
-        if client is None or not client.is_alive():
-            client = self._new_client()
-            self._pool_clients[key] = client
-        return client
+        with self._clients_lock:
+            client = self._pool_clients.get(key)
+            if client is None or not client.is_alive():
+                client = self._new_client()
+                self._pool_clients[key] = client
+            return client
 
     def _service_client(self, service_id: str) -> ExecutorHostClient:
         key = str(service_id or "").strip()
-        client = self._service_clients.get(key)
-        if client is None:
-            raise RuntimeError("service executor host missing")
-        if not client.is_alive():
-            raise RuntimeError("service executor host died")
-        return client
+        with self._clients_lock:
+            client = self._service_clients.get(key)
+            if client is None:
+                raise RuntimeError("service executor host missing")
+            if not client.is_alive():
+                raise RuntimeError("service executor host died")
+            return client
 
     def _pool_client(self, pool_id: str) -> ExecutorHostClient:
         key = str(pool_id or "").strip()
-        client = self._pool_clients.get(key)
-        if client is None:
-            raise RuntimeError("task pool executor host missing")
-        if not client.is_alive():
-            raise RuntimeError("task pool executor host died")
-        return client
+        with self._clients_lock:
+            client = self._pool_clients.get(key)
+            if client is None:
+                raise RuntimeError("task pool executor host missing")
+            if not client.is_alive():
+                raise RuntimeError("task pool executor host died")
+            return client
 
     def is_alive(self) -> bool:
-        if self._closed:
+        with self._clients_lock:
+            closed = self._closed
+            runtime_client = self._runtime_client
+            prepare_client = self._prepare_client
+            service_clients = tuple(self._service_clients.values())
+            pool_clients = tuple(self._pool_clients.values())
+        if closed:
             return False
-        if self._runtime_client is not None and not self._runtime_client.is_alive():
+        if runtime_client is not None and not runtime_client.is_alive():
             return False
-        if self._prepare_client is not None and not self._prepare_client.is_alive():
+        if prepare_client is not None and not prepare_client.is_alive():
             return False
-        return all(client.is_alive() for client in self._service_clients.values()) and all(
-            client.is_alive() for client in self._pool_clients.values()
-        )
+        return all(client.is_alive() for client in service_clients) and all(client.is_alive() for client in pool_clients)
 
     def close(self, *, shutdown_timeout_sec: float = 2.0) -> None:
-        self._closed = True
-        clients = []
-        if self._runtime_client is not None:
-            clients.append(self._runtime_client)
-        if self._prepare_client is not None:
-            clients.append(self._prepare_client)
-        clients.extend(self._service_clients.values())
-        clients.extend(self._pool_clients.values())
-        self._runtime_client = None
-        self._prepare_client = None
-        self._service_clients.clear()
-        self._pool_clients.clear()
+        with self._clients_lock:
+            self._closed = True
+            clients = []
+            if self._runtime_client is not None:
+                clients.append(self._runtime_client)
+            if self._prepare_client is not None:
+                clients.append(self._prepare_client)
+            clients.extend(self._service_clients.values())
+            clients.extend(self._pool_clients.values())
+            self._runtime_client = None
+            self._prepare_client = None
+            self._service_clients.clear()
+            self._pool_clients.clear()
         for client in clients:
             client.close(shutdown_timeout_sec=shutdown_timeout_sec)
 
     def drain_events(self) -> list[Dict[str, Any]]:
         items: list[Dict[str, Any]] = []
-        clients = []
-        if self._runtime_client is not None:
-            clients.append(self._runtime_client)
-        if self._prepare_client is not None:
-            clients.append(self._prepare_client)
-        clients.extend(self._service_clients.values())
-        clients.extend(self._pool_clients.values())
+        with self._clients_lock:
+            clients = []
+            if self._runtime_client is not None:
+                clients.append(self._runtime_client)
+            if self._prepare_client is not None:
+                clients.append(self._prepare_client)
+            clients.extend(self._service_clients.values())
+            clients.extend(self._pool_clients.values())
         for client in clients:
             items.extend(client.drain_events())
         return items
@@ -180,7 +195,8 @@ class SubprocessExecutorBackend:
 
     def stop_service(self, *, service_id: str, reason: str = "") -> None:
         key = str(service_id or "").strip()
-        client = self._service_clients.pop(key, None)
+        with self._clients_lock:
+            client = self._service_clients.pop(key, None)
         if client is None:
             return
         try:
@@ -190,7 +206,9 @@ class SubprocessExecutorBackend:
 
     def service_worker_liveness(self) -> Dict[str, int]:
         out: Dict[str, int] = {}
-        for service_id, client in list(self._service_clients.items()):
+        with self._clients_lock:
+            service_clients = tuple(self._service_clients.items())
+        for service_id, client in service_clients:
             if client is None or not client.is_alive():
                 out[str(service_id)] = 0
                 continue
@@ -201,7 +219,9 @@ class SubprocessExecutorBackend:
         out: Dict[Tuple[str, str], int] = {}
         for service_id, alive in self.service_worker_liveness().items():
             out[("service", str(service_id))] = int(alive)
-        for pool_id, client in list(self._pool_clients.items()):
+        with self._clients_lock:
+            pool_clients = tuple(self._pool_clients.items())
+        for pool_id, client in pool_clients:
             if client is None or not client.is_alive():
                 out[("task_pool", str(pool_id))] = 0
                 continue
@@ -221,7 +241,8 @@ class SubprocessExecutorBackend:
 
     def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None:
         key = str(pool_id or "").strip()
-        client = self._pool_clients.pop(key, None)
+        with self._clients_lock:
+            client = self._pool_clients.pop(key, None)
         if client is None:
             return
         try:
