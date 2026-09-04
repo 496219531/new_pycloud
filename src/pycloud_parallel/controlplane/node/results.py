@@ -316,7 +316,11 @@ def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) 
     tmp_path = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with make_node_object_client(target) as client:
-            client.download_object_to_file(object_id=data_ref.object_id, target_path=str(tmp_path))
+            download_to_file = getattr(client, "download_object_to_file", None)
+            if callable(download_to_file):
+                download_to_file(object_id=data_ref.object_id, target_path=str(tmp_path))
+            else:
+                tmp_path.write_bytes(client.download_object_bytes(object_id=data_ref.object_id))
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
         raise ObjectResolutionError(

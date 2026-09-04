@@ -33,13 +33,20 @@ logger = logging.getLogger(__name__)
 SLOW_HEARTBEAT_LOG_SEC = 2.0
 SLOW_COMPENSATION_LOG_SEC = 2.0
 STATUS_LOG_FETCH_TIMEOUT_SEC = 1.0
-STALE_HEARTBEAT_PENDING_PER_REPLICA = 2
 HEARTBEAT_DEFAULT_MAX_WORKERS = 256
 HEARTBEAT_DEFAULT_RPC_TIMEOUT_SEC = 2.0
 HEARTBEAT_MIN_RPC_TIMEOUT_SEC = 0.05
 HEARTBEAT_MIN_QUEUE_TIMEOUT_SEC = 0.2
 OWNER_ZERO_ALIVE_DISCONNECT_SEC = 100.0
 OWNER_ZERO_ALIVE_BLACKLIST_WINDOW_SEC = 3600.0
+try:
+    HEARTBEAT_GLOBAL_MAX_INFLIGHT = max(
+        1,
+        int(str(os.getenv("PYCLOUD_HEARTBEAT_GLOBAL_MAX_INFLIGHT", "256") or "256")),
+    )
+except (TypeError, ValueError):
+    HEARTBEAT_GLOBAL_MAX_INFLIGHT = 256
+_HEARTBEAT_GLOBAL_SLOTS = threading.BoundedSemaphore(HEARTBEAT_GLOBAL_MAX_INFLIGHT)
 
 
 def _coerce_positive_float(value: Any, default: float = 0.0) -> float:
@@ -107,6 +114,7 @@ class ExecutionSessionBase:
         self._hb_thread = None
         self._hb_lock = threading.Lock()
         self._keepalive_seq = 0
+        self._heartbeat_round_robin_cursor = 0
         self._keepalive_failure_counts = {}
         self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
         self._compensation_executor_lock = threading.Lock()
@@ -229,11 +237,11 @@ class ExecutionSessionBase:
         cap = HEARTBEAT_DEFAULT_MAX_WORKERS
         cap = _coerce_positive_int(str(os.getenv("PYCLOUD_HEARTBEAT_MAX_WORKER_CAP", "") or "").strip(), cap)
         if configured > 0:
-            return max(1, configured)
-        return max(2, min(cap, replica_count))
-
-    def _stale_heartbeat_pending_limit(self) -> int:
-        return max(2, min(64, max(1, len(self.replicas)) * STALE_HEARTBEAT_PENDING_PER_REPLICA))
+            session_limit = max(1, configured)
+        else:
+            session_limit = max(2, min(cap, replica_count))
+        global_fair_share = max(1, HEARTBEAT_GLOBAL_MAX_INFLIGHT // 2)
+        return min(session_limit, global_fair_share)
 
     def _heartbeat_rpc_timeout_sec(self, replica: ExecutionReplicaHandle) -> float:
         explicit = _coerce_positive_float(getattr(replica, "heartbeat_rpc_timeout_sec", 0.0), 0.0)
@@ -1057,19 +1065,25 @@ class ExecutionSessionBase:
                 )
         finally:
             pending_on_exit = getattr(self, "_heartbeat_pending", {})
-            if isinstance(pending_on_exit, dict):
-                for pending_state in list(pending_on_exit.values()):
-                    future = getattr(pending_state, "future", None)
-                    if future is not None:
-                        future.cancel()
-                pending_on_exit.clear()
             stale_on_exit = getattr(self, "_heartbeat_stale_pending", {})
-            if isinstance(stale_on_exit, list):
-                for pending_state in list(stale_on_exit):
+            if not isinstance(stale_on_exit, dict):
+                stale_on_exit = {}
+                self._heartbeat_stale_pending = stale_on_exit
+            if isinstance(pending_on_exit, dict):
+                for node_id, pending_state in list(pending_on_exit.items()):
                     future = getattr(pending_state, "future", None)
-                    if future is not None:
-                        future.cancel()
-                stale_on_exit.clear()
+                    if future is None or future.done() or future.cancel():
+                        pending_on_exit.pop(node_id, None)
+                    else:
+                        stale_on_exit[node_id] = pending_state
+                        pending_on_exit.pop(node_id, None)
+            for node_id, pending_state in list(stale_on_exit.items()):
+                future = getattr(pending_state, "future", None)
+                if future is None or future.done() or future.cancel():
+                    if future is not None and future.done():
+                        with contextlib.suppress(BaseException):
+                            future.result()
+                    stale_on_exit.pop(node_id, None)
             try:
                 active = sorted(self._active_replica_snapshot())
                 retry_probe = sorted(self._retry_probe_replica_snapshot())
@@ -1088,8 +1102,8 @@ class ExecutionSessionBase:
                     terminal,
                     failures,
                     has_compensation,
-                    0,
-                    0,
+                    len(pending_on_exit) if isinstance(pending_on_exit, dict) else 0,
+                    len(stale_on_exit),
                 )
             except Exception:
                 logger.exception("%s keepalive loop exit diagnostics failed", self.kind or "execution")
@@ -1107,14 +1121,26 @@ class ExecutionSessionBase:
         pending = pending_obj if isinstance(pending_obj, dict) else {}
         self._heartbeat_pending = pending
         stale_pending_obj = getattr(self, "_heartbeat_stale_pending", None)
-        stale_pending: list[_HeartbeatPending]
-        stale_pending = stale_pending_obj if isinstance(stale_pending_obj, list) else []
+        stale_pending: Dict[str, _HeartbeatPending]
+        stale_pending = stale_pending_obj if isinstance(stale_pending_obj, dict) else {}
         self._heartbeat_stale_pending = stale_pending
         submitted_count = 0
         completed_count = 0
         failed_count = 0
         queued_not_started = 0
         now = time.monotonic()
+
+        def _cleanup_stale_pending() -> None:
+            for stale_node_id, stale_state in list(stale_pending.items()):
+                stale_future = stale_state.future
+                if stale_future is not None and not stale_future.done():
+                    continue
+                if stale_future is not None:
+                    with contextlib.suppress(BaseException):
+                        stale_future.result()
+                stale_pending.pop(stale_node_id, None)
+
+        _cleanup_stale_pending()
 
         for node_id, pending_state in list(pending.items()):
             future = pending_state.future
@@ -1123,8 +1149,9 @@ class ExecutionSessionBase:
                 pending.pop(node_id, None)
                 continue
             if self.replicas.get(node_id) is not replica:
-                future.cancel()
                 pending.pop(node_id, None)
+                if not future.done() and not future.cancel():
+                    stale_pending[node_id] = pending_state
                 continue
             if future.done():
                 pending.pop(node_id, None)
@@ -1163,37 +1190,37 @@ class ExecutionSessionBase:
                 queue_timeout_sec,
                 rpc_timeout_sec,
                 "yes" if pending_state.started_at > 0 else "no",
-                0,
+                len(stale_pending),
                 error_kind.value,
             )
             self._record_heartbeat_failure(node_id, replica, pending_exc)
             failed_count += 1
             pending.pop(node_id, None)
             if not future.cancel() and pending_state.started_at > 0:
-                stale_pending.append(pending_state)
-                stale_limit = self._stale_heartbeat_pending_limit()
-                if len(stale_pending) > stale_limit:
-                    dropped = len(stale_pending) - stale_limit
-                    del stale_pending[:dropped]
-                    logger.warning(
-                        "%s keepalive stale heartbeat pending limit reached dropped=%s kept=%s heartbeat_error_kind=%s",
-                        self.kind or "execution",
-                        dropped,
-                        stale_limit,
-                        HeartbeatErrorKind.TRANSIENT.value,
-                    )
+                stale_pending[node_id] = pending_state
 
         max_workers = self._heartbeat_max_workers(len(heartbeat_ids))
-        available_submit_slots = max(0, max_workers - len(pending))
-        for node_id in heartbeat_ids:
+        live_rpc_count = len(pending) + len(stale_pending)
+        available_submit_slots = max(0, max_workers - live_rpc_count)
+        ordered_ids = sorted(dict.fromkeys(str(node_id) for node_id in heartbeat_ids if str(node_id)))
+        cursor = int(getattr(self, "_heartbeat_round_robin_cursor", 0) or 0)
+        if ordered_ids:
+            cursor %= len(ordered_ids)
+            ordered_ids = ordered_ids[cursor:] + ordered_ids[:cursor]
+        scanned_count = 0
+        for node_id in ordered_ids:
             if available_submit_slots <= 0:
                 break
-            if node_id in pending:
+            scanned_count += 1
+            if node_id in pending or node_id in stale_pending:
                 continue
             replica = replicas.get(node_id)
             if replica is None:
                 self._discard_active_replica(node_id)
                 continue
+            if not _HEARTBEAT_GLOBAL_SLOTS.acquire(blocking=False):
+                queued_not_started += 1
+                break
             pending_state = _HeartbeatPending(
                 replica=replica,
                 submitted_at=time.monotonic(),
@@ -1208,19 +1235,30 @@ class ExecutionSessionBase:
                 state: _HeartbeatPending = pending_state,
                 fut: Future = future,
             ) -> None:
-                if not fut.set_running_or_notify_cancel():
-                    return
                 try:
-                    fut.set_result(self._timed_heartbeat_replica(nid, rep, seq=seq, pending_state=state))
-                except BaseException as exc:
-                    fut.set_exception(exc)
+                    if not fut.set_running_or_notify_cancel():
+                        return
+                    try:
+                        fut.set_result(self._timed_heartbeat_replica(nid, rep, seq=seq, pending_state=state))
+                    except BaseException as exc:
+                        fut.set_exception(exc)
+                finally:
+                    _HEARTBEAT_GLOBAL_SLOTS.release()
 
             thread = threading.Thread(target=_run, name=f"{self.kind or 'execution'}-hb-call", daemon=True)
             pending_state.future = future
             pending[node_id] = pending_state
-            thread.start()
+            try:
+                thread.start()
+            except Exception:
+                pending.pop(node_id, None)
+                future.cancel()
+                _HEARTBEAT_GLOBAL_SLOTS.release()
+                raise
             submitted_count += 1
             available_submit_slots -= 1
+        if ordered_ids and scanned_count > 0:
+            self._heartbeat_round_robin_cursor = (cursor + scanned_count) % len(ordered_ids)
         if submitted_count > 0:
             time.sleep(0)
         for node_id, pending_state in list(pending.items()):
@@ -1238,53 +1276,8 @@ class ExecutionSessionBase:
             except Exception as exc:
                 failed_count += 1
                 self._handle_heartbeat_exception(node_id, replica, exc)
+        _cleanup_stale_pending()
         return submitted_count, completed_count, failed_count, len(pending) + len(stale_pending), queued_not_started
-
-    def _submit_heartbeat_batch(
-        self,
-        *,
-        executor: ThreadPoolExecutor,
-        pending: Dict[str, _HeartbeatPending],
-        stale_pending: list[_HeartbeatPending],
-        replicas: Dict[str, ExecutionReplicaHandle],
-        heartbeat_ids: list[str],
-        max_workers: int,
-        seq: int,
-    ) -> int:
-        active_future_count = sum(
-            1
-            for state in pending.values()
-            if state.future is not None and not state.future.done()
-        )
-        available_submit_slots = max(0, max_workers - active_future_count)
-        submitted_count = 0
-        for node_id in heartbeat_ids:
-            if available_submit_slots <= 0:
-                break
-            if node_id in pending:
-                continue
-            replica = replicas.get(node_id)
-            if replica is None:
-                self._discard_active_replica(node_id)
-                continue
-            submitted_at = time.monotonic()
-            pending_state = _HeartbeatPending(
-                replica=replica,
-                submitted_at=submitted_at,
-                last_pending_report_at=submitted_at,
-            )
-            future = executor.submit(
-                self._timed_heartbeat_replica,
-                node_id,
-                replica,
-                seq=seq,
-                pending_state=pending_state,
-            )
-            pending_state.future = future
-            pending[node_id] = pending_state
-            submitted_count += 1
-            available_submit_slots -= 1
-        return submitted_count
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:
@@ -1292,6 +1285,7 @@ class ExecutionSessionBase:
                 return
             self.failed = False
             self._keepalive_failure_counts = {}
+            self._heartbeat_round_robin_cursor = 0
             self._active_replica_lock = getattr(self, "_active_replica_lock", threading.RLock())
             with self._active_replica_lock:
                 self._active_replica_ids = set(self.replicas.keys())

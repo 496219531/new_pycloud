@@ -56,7 +56,7 @@ def test_validate_python_runtime_or_raise_uses_unified_message():
 
 def test_infocenter_select_task_nodes_uses_unified_runtime_mismatch_message():
     client = InfoCenterClient("http://127.0.0.1:50051")
-    client.list_nodes = lambda **kwargs: [  # type: ignore[method-assign]
+    client.list_selected_nodes = lambda **kwargs: [  # type: ignore[method-assign]
         InfoCenterNode(
             node_instance_id="node-a-inst",
             node_id="node-a",

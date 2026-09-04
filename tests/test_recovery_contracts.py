@@ -359,6 +359,29 @@ def test_service_compensation_prunes_stale_retry_probe_owner_replica(monkeypatch
     assert closed == ["old"]
 
 
+def test_service_stale_prune_keeps_active_replica_missing_from_limited_discovery() -> None:
+    from pycloud_parallel import Service
+
+    old_node = _node(instance_id="node-inst-old")
+    session = SimpleNamespace(kind="service", service_id="svc-old", failed=False, last_error="")
+    service = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-inst-old": session},
+        nodes={"node-inst-old": old_node},
+    )
+    service._active_replica_ids = {"node-inst-old"}  # noqa: SLF001
+
+    removed = service._prune_stale_owner_replicas(  # noqa: SLF001
+        current_node_instance_ids={"node-inst-new"},
+        current_node_ids={old_node.node_id},
+        active={"node-inst-old"},
+    )
+
+    assert removed == set()
+    assert set(service.sessions) == {"node-inst-old"}
+
+
 def test_service_compensation_redeploys_same_node_after_service_terminal(monkeypatch) -> None:
     from pycloud_parallel import Service
 

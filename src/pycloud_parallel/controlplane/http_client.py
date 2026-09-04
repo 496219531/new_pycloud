@@ -3,15 +3,16 @@ from __future__ import annotations
 """Shared HTTP/JSON helpers for control-plane clients."""
 
 import json
+import http.client
 import logging
 import socket
 from http.client import RemoteDisconnected
 from typing import Dict, Optional
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from .client_transport import _normalize_http_response_body
+from pycloud_parallel.controlplane.http_connection_pool import pooled_http_request
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 logger = logging.getLogger(__name__)
@@ -74,24 +75,28 @@ def http_json_request(
         request_headers,
     )
 
-    req = Request(
-        url,
-        method=method.upper(),
-        headers=request_headers,
-        data=raw,
-    )
     try:
-        with urlopen(req, timeout=max(0.1, float(timeout_sec))) as resp:
-            data = _normalize_http_response_body(json.loads(resp.read().decode("utf-8") or "{}"))
-    except HTTPError as exc:
+        response = pooled_http_request(
+            url=url,
+            method=method,
+            headers=request_headers,
+            body=raw,
+            timeout_sec=timeout_sec,
+        )
         try:
-            body = _normalize_http_response_body(json.loads((exc.read() or b"{}").decode("utf-8") or "{}"))
-        except Exception:
-            body = {"ok": False, "error": exc.reason}
-        raise RuntimeError(str(body.get("error", exc.reason))) from exc
-    except URLError as exc:
+            data = _normalize_http_response_body(json.loads(response.body.decode("utf-8") or "{}"))
+        except json.JSONDecodeError as exc:
+            if response.status >= 400:
+                raise RuntimeError(response.reason or f"HTTP {response.status}") from exc
+            raise RuntimeError(f"invalid JSON response from {urlparse(url).netloc or url}: {exc}") from exc
+        if response.status >= 400:
+            raise RuntimeError(str(data.get("error", response.reason)))
+    except RuntimeError:
+        raise
+    except (OSError, http.client.HTTPException) as exc:
         raise _friendly_http_connect_error(url=url, exc=exc) from exc
-    except RemoteDisconnected as exc:
+    except URLError as exc:
+        # Kept for compatible error normalization if a custom pool adapter uses urllib.
         raise _friendly_http_connect_error(url=url, exc=exc) from exc
     if data.get("ok", False) is False and raise_on_error_response:
         raise RuntimeError(str(data.get("error", "request failed")))

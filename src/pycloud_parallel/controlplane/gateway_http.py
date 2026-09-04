@@ -8,16 +8,20 @@ import ipaddress
 import json
 import threading
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any, BinaryIO, Callable, Dict, Iterable, Optional, Sequence, Tuple
-from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.config import (
     get_gateway_http_body_limit_bytes,
     get_gateway_upload_limits,
 )
+from pycloud_parallel.controlplane.bounded_http_server import (
+    BoundedThreadPoolHTTPServer,
+    DEFAULT_HTTP_MAX_WORKERS,
+    DEFAULT_HTTP_QUEUE_CAPACITY,
+)
+from pycloud_parallel.controlplane.http_connection_pool import pooled_http_request
 from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from .client_transport import (
     _decode_http_request_body_with_mode,
@@ -651,16 +655,21 @@ class GatewayHttpApp:
             if not base_url:
                 raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid route http_base_url"})
             url = f"{base_url}/methods?include_docs={'true' if include_docs else 'false'}"
-            req = Request(url, method="GET")
             try:
-                with urlopen(req, timeout=max(2.0, self.timeout_sec + 1.0)) as resp:
-                    data = json.loads(resp.read().decode("utf-8") or "{}")
-            except HTTPError as exc:
-                try:
-                    data = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-                except Exception:
-                    data = {"ok": False, "error": exc.reason}
-                raise GatewayCallError(status_code=exc.code, data=data) from exc
+                response = pooled_http_request(
+                    url=url,
+                    method="GET",
+                    timeout_sec=max(2.0, self.timeout_sec + 1.0),
+                )
+                if response.status >= 400:
+                    try:
+                        data = json.loads(response.body.decode("utf-8") or "{}")
+                    except Exception:
+                        data = {"ok": False, "error": response.reason or f"HTTP {response.status}"}
+                    raise GatewayCallError(status_code=response.status, data=data)
+                data = json.loads(response.body.decode("utf-8") or "{}")
+            except GatewayCallError:
+                raise
             except Exception as exc:
                 raise GatewayCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
             if not isinstance(data, dict):
@@ -716,28 +725,27 @@ class GatewayHttpApp:
                     mode=serialization_mode,
                 )
             )
-        req = Request(
-            url=url,
-            method="POST",
-            headers=headers,
-            data=request_body,
-        )
         try:
-            with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-                raw = resp.read(MAX_BODY_BYTES + 1)
-                if len(raw) > MAX_BODY_BYTES:
-                    raise GatewayCallError(status_code=502, data={"ok": False, "error": "response too large"})
-                data = _decode_http_response_with_headers(raw, headers=resp.headers, control_addr=route.control_addr)
-        except HTTPError as exc:
-            try:
-                raw = exc.read() or b"{}"
-                if len(raw) > MAX_BODY_BYTES:
-                    data = {"ok": False, "error": "response too large"}
-                else:
-                    data = _decode_http_response_with_headers(raw, headers=getattr(exc, "headers", {}) or {})
-            except Exception:
-                data = {"ok": False, "error": exc.reason}
-            raise GatewayCallError(status_code=exc.code, data=data) from exc
+            response = pooled_http_request(
+                url=url,
+                method="POST",
+                headers=headers,
+                body=request_body,
+                timeout_sec=max(2.0, timeout_sec + 1.0),
+                max_response_bytes=MAX_BODY_BYTES,
+            )
+            raw = response.body
+            if len(raw) > MAX_BODY_BYTES:
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": "response too large"})
+            if response.status >= 400:
+                try:
+                    data = _decode_http_response_with_headers(raw, headers=response.headers)
+                except Exception:
+                    data = {"ok": False, "error": response.reason or f"HTTP {response.status}"}
+                raise GatewayCallError(status_code=response.status, data=data)
+            data = _decode_http_response_with_headers(raw, headers=response.headers, control_addr=route.control_addr)
+        except GatewayCallError:
+            raise
         except Exception as exc:
             raise GatewayCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
         if not isinstance(data, dict):
@@ -965,10 +973,19 @@ class GatewayHttpApp:
 
 
 class GatewayHttpServer:
-    def __init__(self, *, bind: str, app: GatewayHttpApp) -> None:
+    def __init__(
+        self,
+        *,
+        bind: str,
+        app: GatewayHttpApp,
+        max_workers: int = DEFAULT_HTTP_MAX_WORKERS,
+        queue_capacity: int = DEFAULT_HTTP_QUEUE_CAPACITY,
+    ) -> None:
         self._bind = bind
         self.app = app
-        self._server: Optional[ThreadingHTTPServer] = None
+        self.max_workers = int(max_workers)
+        self.queue_capacity = int(queue_capacity)
+        self._server: Optional[BoundedThreadPoolHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
         self.base_url = ""
@@ -982,6 +999,8 @@ class GatewayHttpServer:
             app.start()
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_POST(self):  # noqa: N802
                 try:
                     length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1033,11 +1052,14 @@ class GatewayHttpServer:
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
                 try:
+                    self.close_connection = True
                     self.send_response(int(response.status_code or 200))
                     self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     for key, value in dict(response.extra_headers or {}).items():
+                        if str(key).lower() in {"connection", "content-length", "content-type"}:
+                            continue
                         self.send_header(str(key), str(value))
                     self.end_headers()
                     for chunk in response.body_iter:
@@ -1067,6 +1089,8 @@ class GatewayHttpServer:
                     self.send_response(status_code)
                     self.send_header("Content-Type", str(content_type or "application/octet-stream"))
                     for key, value in dict(extra_headers or {}).items():
+                        if str(key).lower() in {"content-length", "content-type"}:
+                            continue
                         self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
@@ -1078,7 +1102,13 @@ class GatewayHttpServer:
         with self._start_lock:
             if self._server is not None:
                 return
-            self._server = ThreadingHTTPServer((host, port), _Handler)
+            self._server = BoundedThreadPoolHTTPServer(
+                (host, port),
+                _Handler,
+                max_workers=self.max_workers,
+                queue_capacity=self.queue_capacity,
+                thread_name_prefix="gateway-http-worker",
+            )
             self._thread = threading.Thread(target=self._server.serve_forever, name="gateway-http", daemon=True)
             self._thread.start()
         public_host = resolve_public_host(host)

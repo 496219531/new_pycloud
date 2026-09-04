@@ -29,12 +29,18 @@
 | `PYCLOUD_DATAREF_UPLOAD_STRATEGY` | `upload_once` | 内部链路大对象默认只上传到一个 node，其他层转发 `DataRef` |
 | `PYCLOUD_DATAREF_RESOLUTION` | `remote_fetch` | worker/client 解析 `DataRef` 时允许按 locator/registry 远程拉取并本地缓存 |
 | `PYCLOUD_JOBQUEUE_RESOLVE_REFS` | `defer_to_worker` | JobQueue 默认不在 job-orch 实例化业务 `DataRef`，交给最终 worker 解析 |
-| `PYCLOUD_GATEWAY_DATAREF_RELAY` | `eager` | gateway 仍保持旧的 eager relay 默认，外部链路后续单独收口 |
+| `PYCLOUD_GATEWAY_DATAREF_RELAY` | `lazy` | gateway 默认转发可信 locator，不复制对象本体；可显式回滚为流式 eager relay |
 | `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES` | `16777216` | node control HTTP 单条发送消息限制；旧名 `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES` 仍兼容 |
 | `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES` | `16777216` | node control HTTP 单条接收消息限制；旧名 `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` 仍兼容 |
 | `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 与 `pycloudctl dev-start` 的默认 worker capacity；`pycloudctl start` 不启动 node |
 | `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role node` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
 | `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl HTTP server 的默认线程池大小 |
+| `PYCLOUD_HTTP_MAX_CONNECTIONS_PER_ORIGIN` | `32` | client 对单个 HTTP origin 的最大并发连接数；空闲连接会复用 |
+| `PYCLOUD_HTTP_IDLE_CONNECTION_TTL_SEC` | `0.25` | client 空闲连接保留时间；短于 server 0.5 秒 idle timeout，避免复用临界失效连接 |
+| `PYCLOUD_NODE_INACTIVE_RESOURCE_HISTORY_LIMIT` | `100` | node 内保留的已停止 service/task-pool 诊断记录上限 |
+| `PYCLOUD_PACKAGE_INCLUDE_TESTS` | `false` | artifact 打包是否包含 tests/test_*.py |
+| `PYCLOUD_PACKAGE_CACHE_MAX_ENTRIES` | `128` | 本地 artifact package cache 最大条目数 |
+| `PYCLOUD_PACKAGE_CACHE_MAX_BYTES` | `1073741824` | 本地 artifact package cache 最大总字节数 |
 | `PYCLOUD_SERVICE_DEFAULT_WORKERS` | `10` | 单个 service 默认 worker 数 |
 | `PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC` | `30` | service 默认 heartbeat timeout |
 | `PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC` | `60` | TaskPool owner heartbeat timeout；可按长批量任务或慢网络场景调大 |
@@ -161,8 +167,9 @@ local_threshold = min(max(1, PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), PYCL
   - 含义：JobQueue 不在 job-orch 提前 materialize 业务 `DataRef`，最终执行 worker 再解析
 
 - `PYCLOUD_GATEWAY_DATAREF_RELAY`
-  - 默认：`eager`
-  - 含义：gateway 仍使用旧默认；外部 gateway_public 的 DataRef locator 信任策略不在本轮调整
+  - 默认：`lazy`
+  - 回滚：显式设为 `eager`
+  - 含义：gateway 默认转发可信 locator；`eager` 会通过临时文件流式复制到目标 node，不在 gateway 内整包物化 bytes
 
 ### 2.4 control HTTP body size
 
@@ -212,7 +219,17 @@ node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。�
 
 - `PYCLOUD_NODE_MAX_WORKERS`
   - 默认：`64`
-  - NodeControl HTTP server 线程池大小
+  - NodeControl HTTP server 线程池大小；请求 worker 和等待队列都有硬上限
+
+- `PYCLOUD_HTTP_MAX_CONNECTIONS_PER_ORIGIN`
+  - 默认：`32`
+  - heartbeat、status、service/task 控制请求共享按 origin 隔离的 HTTP/1.1 连接池
+  - GET/HEAD/OPTIONS 遇到失效复用连接可重试一次；POST 不做传输层自动重试，避免重复副作用
+
+- `PYCLOUD_HTTP_IDLE_CONNECTION_TTL_SEC`
+  - 默认：`0.25`
+  - server 默认 keep-alive idle timeout 为 `0.5` 秒；client 提前淘汰空闲连接，避免在服务端关闭临界点复用 stale socket
+  - 配置值会被钳制到 server timeout 的 80% 以内，当前最大为 `0.4` 秒
 
 - `PYCLOUD_SERVICE_DEFAULT_WORKERS`
   - 默认：`10`

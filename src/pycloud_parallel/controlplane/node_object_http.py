@@ -10,7 +10,7 @@ import json
 import os
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, Dict, Optional, Tuple, Union
@@ -19,6 +19,11 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
+from pycloud_parallel.controlplane.bounded_http_server import (
+    BoundedThreadPoolHTTPServer,
+    DEFAULT_HTTP_MAX_WORKERS,
+    DEFAULT_HTTP_QUEUE_CAPACITY,
+)
 from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
     get_node_control_http_body_limit_bytes,
@@ -338,10 +343,20 @@ class NodeObjectHttpApp:
 
 
 class NodeObjectHttpServer:
-    def __init__(self, *, bind: str, state: NodeControlState, max_body_bytes: int = MAX_OBJECT_HTTP_BODY_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        bind: str,
+        state: NodeControlState,
+        max_body_bytes: int = MAX_OBJECT_HTTP_BODY_BYTES,
+        max_workers: int = DEFAULT_HTTP_MAX_WORKERS,
+        queue_capacity: int = DEFAULT_HTTP_QUEUE_CAPACITY,
+    ) -> None:
         self.bind = bind
         self.app = NodeObjectHttpApp(state, max_body_bytes=max_body_bytes)
-        self._server: Optional[ThreadingHTTPServer] = None
+        self.max_workers = int(max_workers)
+        self.queue_capacity = int(queue_capacity)
+        self._server: Optional[BoundedThreadPoolHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
 
@@ -350,6 +365,8 @@ class NodeObjectHttpServer:
         app = self.app
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):  # noqa: N802
                 result = app.handle_get(self.path)
                 if isinstance(result, StreamingHttpResponse):
@@ -378,6 +395,8 @@ class NodeObjectHttpServer:
                 try:
                     self.send_response(int(status_code))
                     for key, value in dict(headers or {}).items():
+                        if str(key).lower() == "content-length":
+                            continue
                         self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw or b"")))
                     self.end_headers()
@@ -388,10 +407,12 @@ class NodeObjectHttpServer:
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
                 try:
+                    self.close_connection = True
                     self.send_response(int(response.status_code or 200))
                     self.send_header("Content-Type", str(response.content_type or "application/octet-stream"))
+                    self.send_header("Connection", "close")
                     for key, value in dict(response.extra_headers or {}).items():
-                        if str(key).lower() == "content-type":
+                        if str(key).lower() in {"connection", "content-length", "content-type"}:
                             continue
                         self.send_header(str(key), str(value))
                     if int(response.content_length or 0) > 0:
@@ -403,7 +424,13 @@ class NodeObjectHttpServer:
                 except (BrokenPipeError, ConnectionResetError):
                     return
 
-        self._server = ThreadingHTTPServer((host, int(port)), _Handler)
+        self._server = BoundedThreadPoolHTTPServer(
+            (host, int(port)),
+            _Handler,
+            max_workers=self.max_workers,
+            queue_capacity=self.queue_capacity,
+            thread_name_prefix="node-object-http-worker",
+        )
         actual_port = self._server.server_address[1]
         public_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
         self.base_url = f"http://{public_host}:{actual_port}"

@@ -443,7 +443,8 @@ class StartupServiceNode(NodeControlState):
         timeout_sec: float = 60.0,
         max_concurrency: int = 100,
     ):
-        del max_concurrency
+        if int(max_concurrency) <= 0:
+            raise ValueError("max_concurrency must be greater than 0")
         if isinstance(payloads, list):
             if len(payloads) != 1:
                 raise ValueError("local startup broadcast accepts exactly one payload")

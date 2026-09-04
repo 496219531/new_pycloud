@@ -1230,18 +1230,24 @@ class _ConnectedService:
         route_cache = self._route_cache
         normalized_method = str(method or "").strip()
         routes: List[InfoCenterServiceRoute] = []
+        cache_lookup_completed = False
         if route_cache is not None:
-            if normalized_method and hasattr(route_cache, "refresh_for_method"):
-                with contextlib.suppress(Exception):
-                    routes = list(route_cache.refresh_for_method(self.service_name, method=normalized_method))
-            elif force_refresh:
-                with contextlib.suppress(Exception):
-                    route_cache.refresh(self.service_name, force=True)
-                with contextlib.suppress(Exception):
+            try:
+                if normalized_method and hasattr(route_cache, "refresh_for_method"):
+                    routes = list(
+                        route_cache.refresh_for_method(
+                            self.service_name,
+                            method=normalized_method,
+                            force=force_refresh,
+                        )
+                    )
+                elif force_refresh:
+                    routes = list(route_cache.refresh(self.service_name, force=True))
+                else:
                     routes = list(route_cache.get_routes(self.service_name))
-            else:
-                with contextlib.suppress(Exception):
-                    routes = list(route_cache.get_routes(self.service_name))
+                cache_lookup_completed = True
+            except Exception:
+                pass
         routes = [route for route in routes if str(getattr(route, "service_name", "") or "").strip() == self.service_name]
         if normalized_method:
             routes = [
@@ -1253,6 +1259,8 @@ class _ConnectedService:
             self._refresh_effective_policy_from_routes(routes)
             self._emit_route_notice_once(routes)
             return routes
+        if cache_lookup_completed:
+            return []
         routes = self._discover_routes_from_nodes()
         if normalized_method:
             routes = [
@@ -1382,15 +1390,14 @@ class _ConnectedService:
         *,
         timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
         max_attempts: int = 0,
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
-        del refresh_status, max_attempts
         if self.route == "local":
             effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
         else:
-            self._ensure_effective_policy_loaded(force_refresh=(self.route == "discovery"))
+            self._ensure_effective_policy_loaded(force_refresh=bool(refresh_status))
             effective_serialization_mode = resolve_effective_serialization_mode(
                 request_mode=serialization_mode,
                 context="gateway_public" if self.route == "gateway" else "service_call",
@@ -1405,18 +1412,16 @@ class _ConnectedService:
             last_failed_route_id = ""
             last_error: Optional[Exception] = None
             token = getattr(self._transport_client, "service_token", "")
+            forced_refresh_done = bool(refresh_status)
+            attempt_limit = max(0, int(max_attempts or 0))
 
             def _select_route():
                 method_blacklist = self._method_node_blacklist.get(str(method or "").strip(), {})
                 if route_cache is not None:
-                    route_rows = []
-                    with contextlib.suppress(Exception):
-                        route_rows = list(
-                            route_cache.refresh_for_method(self.service_name, method=method)
-                            if hasattr(route_cache, "refresh_for_method")
-                            else route_cache.get_routes(self.service_name)
-                        )
-                    max_route_attempts = max(1, len(route_rows) if route_rows else len(tried) + 1)
+                    max_route_attempts = max(
+                        1,
+                        (attempt_limit - attempt_count) if attempt_limit else int(getattr(route_cache, "route_limit", 500)),
+                    )
                     for _attempt in range(max_route_attempts):
                         selected = route_cache.select_route(
                             self.service_name,
@@ -1435,7 +1440,7 @@ class _ConnectedService:
                     )
                 candidates = [
                     item
-                    for item in self._discoverable_routes(force_refresh=True, method=method)
+                    for item in self._discoverable_routes(force_refresh=False, method=method)
                     if str(getattr(item, "service_id", "") or "") not in tried
                 ]
                 candidates = [
@@ -1447,48 +1452,15 @@ class _ConnectedService:
                     raise RuntimeError(f"no available route for service_name={self.service_name!r}")
                 return sorted(candidates, key=lambda item: _route_sort_key(item, strategy=strategy_name))[0]
 
-            def _has_alternative() -> bool:
-                method_blacklist = self._method_node_blacklist.get(str(method or "").strip(), {})
+            def _force_refresh_once() -> None:
+                nonlocal forced_refresh_done
+                if forced_refresh_done:
+                    return
+                forced_refresh_done = True
                 if route_cache is not None:
-                    with contextlib.suppress(Exception):
-                        route_rows = (
-                            route_cache.refresh_for_method(self.service_name, method=method)
-                            if hasattr(route_cache, "refresh_for_method")
-                            else route_cache.get_routes(self.service_name)
-                        )
-                        cached = [
-                            item
-                            for item in route_rows
-                            if str(getattr(item, "service_id", "") or "") not in tried
-                            and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
-                        ]
-                        if cached:
-                            return True
-                    with contextlib.suppress(Exception):
-                        route_rows = (
-                            route_cache.refresh_for_method(self.service_name, method=method)
-                            if hasattr(route_cache, "refresh_for_method")
-                            else route_cache.refresh(self.service_name, force=True)
-                        )
-                        return bool(
-                            [
-                                item
-                                for item in route_rows
-                                if str(getattr(item, "service_id", "") or "") not in tried
-                                and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
-                            ]
-                        )
-                    return True
-                with contextlib.suppress(Exception):
-                    return bool(
-                        [
-                            item
-                            for item in self._discoverable_routes(force_refresh=True, method=method)
-                            if str(getattr(item, "service_id", "") or "") not in tried
-                            and self._client_mod._node_instance_key_from_route(item) not in method_blacklist
-                        ]
-                    )
-                return True
+                    route_cache.refresh(self.service_name, force=True)
+                else:
+                    self._discoverable_routes(force_refresh=True, method=method)
 
             def _record_observation(*, selected_route_id: str = "") -> None:
                 if route_cache is None:
@@ -1530,6 +1502,9 @@ class _ConnectedService:
                 return self._client_mod._node_instance_key_from_route(selected_route), resp
 
             while True:
+                if attempt_limit and attempt_count >= attempt_limit:
+                    _record_observation()
+                    raise RuntimeError(f"call failed after {attempt_count} attempt(s): {last_error}") from last_error
                 try:
                     route = _select_route()
                 except Exception as select_exc:
@@ -1563,7 +1538,7 @@ class _ConnectedService:
                             dependency_failure_reason(exc, method=method)
                         )
                     failure_kind = classify_service_error(exc, route_failure=self._client_mod._is_route_failure(exc))
-                    if not should_failover(failure_kind, has_alternative_candidate=_has_alternative()):
+                    if not should_failover(failure_kind, has_alternative_candidate=True):
                         if route_cache is not None:
                             with contextlib.suppress(Exception):
                                 route_cache.release_route(route)
@@ -1574,12 +1549,13 @@ class _ConnectedService:
                     if route_cache is not None:
                         with contextlib.suppress(Exception):
                             route_cache.mark_failure(route, str(exc))
+                    if not attempt_limit or attempt_count < attempt_limit:
                         with contextlib.suppress(Exception):
-                            route_cache.refresh(self.service_name, force=True)
+                            _force_refresh_once()
                     continue
                 except Exception as exc:
                     last_error = exc
-                    if not should_failover(STAGING_FAILED, has_alternative_candidate=_has_alternative()):
+                    if not should_failover(STAGING_FAILED, has_alternative_candidate=True):
                         if route_cache is not None:
                             with contextlib.suppress(Exception):
                                 route_cache.release_route(route)
@@ -1590,8 +1566,9 @@ class _ConnectedService:
                     if route_cache is not None:
                         with contextlib.suppress(Exception):
                             route_cache.mark_failure(route, str(exc))
+                    if not attempt_limit or attempt_count < attempt_limit:
                         with contextlib.suppress(Exception):
-                            route_cache.refresh(self.service_name, force=True)
+                            _force_refresh_once()
                     continue
         response = self._transport_client.call(
             service_name=self.service_name,
@@ -1610,7 +1587,7 @@ class _ConnectedService:
         *,
         timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
         max_attempts: int = 0,
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
@@ -1637,16 +1614,113 @@ class _ConnectedService:
         timeout_sec: float = 600.0,
         max_concurrency: int = 100,
     ):
-        del max_concurrency
+        concurrency = int(max_concurrency)
+        if concurrency <= 0:
+            raise ValueError("max_concurrency must be greater than 0")
         if isinstance(payload, list):
             if len(payload) != 1:
                 raise ValueError(f"{self.route} connected service broadcast accepts exactly one payload")
             payload = dict(payload[0] or {})
+        normalized_payload = dict(payload or {})
+
+        if self.route == "discovery":
+            self._ensure_effective_policy_loaded(force_refresh=False)
+            effective_serialization_mode = resolve_effective_serialization_mode(
+                request_mode="",
+                context="service_call",
+                frozen_mode=self.serialization_mode,
+            )
+            route_cache = self._route_cache
+            if route_cache is None:
+                routes = self._discoverable_routes(force_refresh=False, method=method)
+            else:
+                available = list(route_cache.refresh_for_method(self.service_name, method=method))
+                routes = []
+                excluded: Set[str] = set()
+                method_blacklist = self._method_node_blacklist.get(str(method or "").strip(), {})
+                for _ in range(len(available)):
+                    try:
+                        route = route_cache.select_route(
+                            self.service_name,
+                            exclude_service_ids=excluded,
+                            strategy="predicted_busy",
+                            method=method,
+                        )
+                    except RuntimeError:
+                        break
+                    route_id = str(getattr(route, "service_id", "") or "")
+                    if not route_id or route_id in excluded:
+                        with contextlib.suppress(Exception):
+                            route_cache.release_route(route)
+                        break
+                    excluded.add(route_id)
+                    if self._client_mod._node_instance_key_from_route(route) in method_blacklist:
+                        with contextlib.suppress(Exception):
+                            route_cache.release_route(route)
+                        continue
+                    routes.append(route)
+
+            semaphore = asyncio.Semaphore(min(concurrency, max(1, len(routes))))
+            loop = asyncio.get_running_loop()
+            token = getattr(self._transport_client, "service_token", "")
+
+            async def _call_one(route: object):
+                node_id = self._client_mod._node_instance_key_from_route(route)
+                async with semaphore:
+                    try:
+                        def _invoke():
+                            prepared_payload = (
+                                self._prepare_discovery_route_payload(route, normalized_payload)
+                                if self._prepare_discovery_payload_enabled
+                                else dict(normalized_payload)
+                            )
+                            call_kwargs = {
+                                "method": method,
+                                "payload": prepared_payload,
+                                "timeout_sec": max(0.1, float(timeout_sec)),
+                                "service_token": token,
+                            }
+                            if effective_serialization_mode and effective_serialization_mode != "legacy_v1":
+                                call_kwargs["serialization_mode"] = effective_serialization_mode
+                            if self.effective_policy is not None:
+                                call_kwargs["effective_policy"] = self.effective_policy
+                            response = self._client_mod._call_route_http(route, **call_kwargs)
+                            attach_locator = getattr(self._transport_client, "_attach_controlplane_locator", None)
+                            if callable(attach_locator):
+                                response = attach_locator(response, route=route)
+                            return response
+
+                        response = await loop.run_in_executor(self._get_async_call_executor(), _invoke)
+                        if route_cache is not None:
+                            with contextlib.suppress(Exception):
+                                route_cache.mark_success(route)
+                        return node_id, response, None
+                    except Exception as exc:
+                        if route_cache is not None:
+                            failure_kind = classify_service_error(
+                                exc,
+                                route_failure=(
+                                    isinstance(exc, self._client_mod.DiscoveryCallError)
+                                    and self._client_mod._is_route_failure(exc)
+                                ),
+                            )
+                            if failure_kind in {ROUTE_UNAVAILABLE, STAGING_FAILED, CONTROLPLANE_UNAVAILABLE}:
+                                with contextlib.suppress(Exception):
+                                    route_cache.mark_failure(route, str(exc))
+                            else:
+                                with contextlib.suppress(Exception):
+                                    route_cache.release_route(route)
+                        return node_id, None, exc
+
+            if not routes:
+                return [(self.service_name, None, RuntimeError(f"no available route for service_name={self.service_name!r}"))]
+            return list(await asyncio.gather(*(_call_one(route) for route in routes)))
+
         node_id = "local" if self.route == "local" else self.service_name
         try:
             called_node_id, response = await self.acall_balanced(
                 method,
-                dict(payload or {}),
+                normalized_payload,
                 timeout_sec=timeout_sec,
                 refresh_status=False,
             )
@@ -1678,14 +1752,13 @@ class _ConnectedService:
         *,
         timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
         serialization_mode: str = "",
     ):
-        del refresh_status
         if self.route == "local":
             effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
         else:
-            self._ensure_effective_policy_loaded(force_refresh=True)
+            self._ensure_effective_policy_loaded(force_refresh=bool(refresh_status))
             effective_serialization_mode = resolve_effective_serialization_mode(
                 request_mode=serialization_mode,
                 context="gateway_public" if self.route == "gateway" else "service_call",
@@ -1759,6 +1832,7 @@ class _ConnectedService:
                 self.service_name,
                 strategy=resolve_service_strategy(strategy)[0],
                 method=method,
+                force_refresh=bool(refresh_status),
             )
             if self._route_cache is not None
             else sorted(
@@ -2144,8 +2218,8 @@ class Service(ServiceExecutionSession):
                     "node_id": node_id,
                     "control_addr": control_addr,
                     "service_name": str(self.service_name or ""),
-                    "service_id": str(session.service_id or ""),
-                    "http_base_url": str(session.http_base_url or ""),
+                    "service_id": str(getattr(session, "service_id", "") or ""),
+                    "http_base_url": str(getattr(session, "http_base_url", "") or ""),
                 }
             )
         return routes
@@ -2197,13 +2271,23 @@ class Service(ServiceExecutionSession):
         self,
         *,
         current_node_instance_ids: set[str],
+        current_node_ids: Optional[set[str]] = None,
         active: set[str],
     ) -> set[str]:
         current = {str(node_id) for node_id in current_node_instance_ids if str(node_id)}
+        logical_ids = {str(node_id) for node_id in (current_node_ids or set()) if str(node_id)}
         removed: set[str] = set()
         for node_key in list(self.sessions.keys()):
             normalized = str(node_key or "").strip()
-            if not normalized or normalized in current:
+            node = self.nodes.get(normalized)
+            logical_node_id = str(getattr(node, "node_id", "") or "").strip()
+            if (
+                not normalized
+                or normalized in current
+                or normalized in active
+                or not logical_node_id
+                or logical_node_id not in logical_ids
+            ):
                 continue
             self._remove_owner_replica(normalized, reason="node instance not present in current InfoCenter discovery")
             removed.add(normalized)
@@ -2277,6 +2361,8 @@ class Service(ServiceExecutionSession):
             self.nodes[normalized] = node
             self.failures.pop(normalized, None)
             self._breaker_states.setdefault(normalized, CandidateBreakerState())
+            setattr(session, "_hb_thread", self._hb_thread)
+            setattr(session, "_hb_lock", self._hb_lock)
             self._mark_replica_heartbeat_success(normalized, session, allow_new=True)
         self._wake_keepalive()
         return True
@@ -2482,6 +2568,21 @@ class Service(ServiceExecutionSession):
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
             }
+            current_node_ids = {
+                str(getattr(node, "node_id", "") or "").strip()
+                for node in discovered_nodes
+                if str(getattr(node, "node_id", "") or "").strip()
+            }
+            removed_stale = self._prune_stale_owner_replicas(
+                current_node_instance_ids=current_node_instance_ids,
+                current_node_ids=current_node_ids,
+                active=active,
+            )
+            if removed_stale:
+                active.difference_update(removed_stale)
+                deployed_active.difference_update(removed_stale)
+                failed.difference_update(removed_stale)
+                retryable_failed.difference_update(removed_stale)
             select_started_at = time.monotonic()
             requested_instance_ids = [
                 str(item).strip() for item in list(spec.get("node_instance_ids") or ()) if str(item).strip()
@@ -3943,7 +4044,7 @@ class Service(ServiceExecutionSession):
                             node_key,
                             f"service-create:{effective_owner_client_id}:{effective_service_name}:{create_request_namespace}:{node_key}",
                         ),
-                        wait_ready=False,
+                        wait_ready=True,
                         timeout_sec=timeout_sec,
                     )
                 except Exception as exc:
@@ -4982,7 +5083,7 @@ class Service(ServiceExecutionSession):
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close(end_services=False)
+        self.close(end_services=True, reason="service context exited")
 
     def node_ids(self) -> Sequence[str]:
         return [self.nodes[key].node_id if key in self.nodes else key for key in self.sessions.keys()]
@@ -5122,10 +5223,7 @@ class Service(ServiceExecutionSession):
     def _effective_worker_count(self) -> int:
         total_workers = 0
         for session in self.sessions.values():
-            alive_workers = 0
-            with contextlib.suppress(Exception):
-                info = session.get_status()
-                alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+            alive_workers = max(0, int(getattr(session, "alive_workers", 0) or 0))
             worker_count = max(0, int(getattr(session, "worker_count", 0) or 0))
             total_workers += max(alive_workers, worker_count, 0)
         return max(1, total_workers)
@@ -5309,6 +5407,9 @@ class Service(ServiceExecutionSession):
                         readiness = _refresh_readiness(session)
                     except Exception:
                         continue
+                    with contextlib.suppress(Exception):
+                        session.alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+                        session.in_flight = max(0, int(getattr(info, "in_flight", 0) or 0))
                     if info.status == pb2.SERVICE_STATUS_RUNNING and (not readiness or readiness == "ready"):
                         ready_candidates.append(node_id)
                 candidates = ready_candidates
@@ -5333,12 +5434,18 @@ class Service(ServiceExecutionSession):
                     readiness = _refresh_readiness(session)
                 except Exception:
                     continue
+                with contextlib.suppress(Exception):
+                    session.alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+                    session.in_flight = max(0, int(getattr(info, "in_flight", 0) or 0))
                 if info.status != pb2.SERVICE_STATUS_RUNNING:
                     continue
                 if readiness and readiness != "ready":
                     continue
-            in_flight = int(info.in_flight if info is not None else 0)
-            alive_workers = int(info.alive_workers if info is not None else session.worker_count)
+            in_flight = max(0, int(getattr(session, "in_flight", 0) or 0))
+            alive_workers = max(
+                0,
+                int(getattr(session, "alive_workers", 0) or getattr(session, "worker_count", 0) or 0),
+            )
             predicted_busy = float(in_flight) / float(max(1, alive_workers))
             scheduler_candidates.append(
                 (
@@ -5426,7 +5533,7 @@ class Service(ServiceExecutionSession):
         *,
         timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
         max_attempts: int = 0,
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
@@ -5493,7 +5600,7 @@ class Service(ServiceExecutionSession):
         *,
         timeout_sec: float = 600.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
         max_attempts: int = 0,
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
@@ -5727,7 +5834,7 @@ class Service(ServiceExecutionSession):
             group=self,
             timeout_sec=600.0,
             strategy="predicted_busy",
-            refresh_status=True,
+            refresh_status=False,
         )
 
     def _ensure_methods_discovered(self) -> None:

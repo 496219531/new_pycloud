@@ -11,6 +11,8 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from pycloud_parallel.controlplane.http_connection_pool import pooled_http_request
+
 from pycloud_parallel.controlplane.config import (
     PayloadPolicy,
     get_payload_policy,
@@ -466,30 +468,27 @@ def _call_route_http(
             effective_policy=effective_policy,
         )
         request_body = json.dumps(serialized_payload).encode("utf-8")
-    req = Request(
-        url=url,
-        method="POST",
-        headers=headers,
-        data=request_body,
-    )
     try:
-        with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-            raw = resp.read()
-            data = _decode_http_response_with_headers(
-                raw,
-                headers=resp.headers,
-                control_addr=route.control_addr,
-            )
-    except HTTPError as exc:
-        try:
-            raw = exc.read() or b"{}"
-            data = _decode_http_response_with_headers(
-                raw,
-                headers=getattr(exc, "headers", {}) or {},
-            )
-        except Exception:
-            data = {"ok": False, "error": exc.reason}
-        raise DiscoveryCallError(status_code=exc.code, data=data) from exc
+        response = pooled_http_request(
+            url=url,
+            method="POST",
+            headers=headers,
+            body=request_body,
+            timeout_sec=max(2.0, timeout_sec + 1.0),
+        )
+        if response.status >= 400:
+            try:
+                data = _decode_http_response_with_headers(response.body, headers=response.headers)
+            except Exception:
+                data = {"ok": False, "error": response.reason or f"HTTP {response.status}"}
+            raise DiscoveryCallError(status_code=response.status, data=data)
+        data = _decode_http_response_with_headers(
+            response.body,
+            headers=response.headers,
+            control_addr=route.control_addr,
+        )
+    except DiscoveryCallError:
+        raise
     except Exception as exc:
         raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
     if not data.get("ok", False):
@@ -584,16 +583,21 @@ def _list_route_methods_http(
 ) -> List[Dict[str, object]]:
     params = urlencode({"include_docs": "true" if include_docs else "false"})
     url = f"{route.http_base_url}/methods?{params}"
-    req = Request(url, method="GET")
     try:
-        with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-            data = json.loads(resp.read().decode("utf-8") or "{}")
-    except HTTPError as exc:
-        try:
-            data = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-        except Exception:
-            data = {"ok": False, "error": exc.reason}
-        raise DiscoveryCallError(status_code=exc.code, data=data) from exc
+        response = pooled_http_request(
+            url=url,
+            method="GET",
+            timeout_sec=max(2.0, timeout_sec + 1.0),
+        )
+        if response.status >= 400:
+            try:
+                data = json.loads(response.body.decode("utf-8") or "{}")
+            except Exception:
+                data = {"ok": False, "error": response.reason or f"HTTP {response.status}"}
+            raise DiscoveryCallError(status_code=response.status, data=data)
+        data = json.loads(response.body.decode("utf-8") or "{}")
+    except DiscoveryCallError:
+        raise
     except Exception as exc:
         raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
     if not isinstance(data, dict):

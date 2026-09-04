@@ -314,7 +314,7 @@ export PYCLOUD_JOBQUEUE_RESOLVE_REFS=eager
 export PYCLOUD_DATAREF_RESOLUTION=local_only
 ```
 
-`PYCLOUD_GATEWAY_DATAREF_RELAY` 仍默认 `eager`，gateway/public DataRef 信任边界后续单独处理。
+`PYCLOUD_GATEWAY_DATAREF_RELAY` 默认 `lazy`；只有明确需要把对象复制到目标 node 时才设置为 `eager`。
 
 显式示例：
 

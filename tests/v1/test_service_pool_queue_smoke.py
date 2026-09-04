@@ -49,6 +49,7 @@ def _register_node(info_target: str, *, node_id: str, control_addr: str, state: 
     with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
         infocenter.register_node(
             node_id=node_id,
+            node_instance_id=state.node_instance_id,
             control_addr=control_addr,
             capacity=8,
             queue_capacity=64,
@@ -60,6 +61,8 @@ def _register_node(info_target: str, *, node_id: str, control_addr: str, state: 
 
 
 def test_service_task_pool_and_job_queue_smoke(tmp_path):
+    from pycloud_parallel.controlplane import job_queue as job_queue_mod
+
     infocenter = build_infocenter_server("127.0.0.1:0")
     infocenter.start()
     gateway = build_gateway_server("127.0.0.1:0", infocenter_addr=infocenter.base_url)
@@ -154,7 +157,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
         )
         with patch(
             "pycloud_parallel.controlplane.job_queue._create_job_task_pool",
-            wraps=TaskPool._from_infocenter,
+            wraps=job_queue_mod._create_job_task_pool,
         ) as mocked_create_pool:
             client = JobQueue.connect(infocenter.base_url, client_id="v1-smoke-job-client", timeout_sec=10.0)
             try:

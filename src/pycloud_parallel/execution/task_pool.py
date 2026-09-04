@@ -118,7 +118,7 @@ def _taskpool_create_rpc_timeout_sec(timeout_sec: float) -> float:
         overall = 0.0
     if overall <= 0.0:
         return 600.0
-    return max(10.0, overall)
+    return max(30.0, overall)
 
 
 def _resolve_owner_api_token(api_token: str = "") -> str:
@@ -1334,14 +1334,23 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self,
         *,
         current_node_instance_ids: set[str],
+        current_node_ids: Optional[set[str]] = None,
         active: set[str],
     ) -> set[str]:
-        del active
         current = {str(node_id) for node_id in current_node_instance_ids if str(node_id)}
+        logical_ids = {str(node_id) for node_id in (current_node_ids or set()) if str(node_id)}
         removed: set[str] = set()
         for node_key in list(self._pools.keys()):
             normalized = str(node_key or "").strip()
-            if not normalized or normalized in current:
+            node = self.nodes.get(normalized)
+            logical_node_id = str(getattr(node, "node_id", "") or "").strip()
+            if (
+                not normalized
+                or normalized in current
+                or normalized in active
+                or not logical_node_id
+                or logical_node_id not in logical_ids
+            ):
                 continue
             self._remove_owner_replica(normalized, reason="node instance not present in current InfoCenter discovery")
             removed.add(normalized)
@@ -1543,6 +1552,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)
             }
+            current_node_ids = {
+                str(getattr(node, "node_id", "") or "").strip()
+                for node in selected_nodes
+                if str(getattr(node, "node_id", "") or "").strip()
+            }
+            removed_stale = self._prune_stale_owner_replicas(
+                current_node_instance_ids=current_node_instance_ids,
+                current_node_ids=current_node_ids,
+                active=active,
+            )
+            if removed_stale:
+                active.difference_update(removed_stale)
+                deployed_active.difference_update(removed_stale)
+                failed.difference_update(removed_stale)
+                retryable_failed.difference_update(removed_stale)
             candidate_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in candidates if _node_instance_key_from_node(node)
             }
@@ -1886,13 +1910,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         total_workers = 0
         for node_id in self._available_pool_node_ids():
             pool = self._pools.get(node_id)
+            if pool is None:
+                continue
             worker_capacity = max(0, int(getattr(pool, "worker_count", 0) or 0))
-            alive_workers = 0
-            if pool is not None:
-                with contextlib.suppress(Exception):
-                    info = pool.get_status()
-                    alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
-                    worker_capacity = max(worker_capacity, int(getattr(info, "worker_count", 0) or 0))
+            alive_workers = max(0, int(getattr(pool, "alive_workers", 0) or 0))
             total_workers += max(alive_workers, worker_capacity, 0)
         return max(1, total_workers)
 
@@ -1953,6 +1974,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_id_prefix: str = "",
         timeout_hint_sec: int = 0,
         priority: int = 1,
+        runtime_key: str = "",
         serialization_mode: str = "",
         use_transport_payload: bool = True,
     ) -> pb2.TaskSubmitItem:
@@ -1970,6 +1992,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             "task_id": task_id,
             "timeout_hint_sec": max(0, int(timeout_hint_sec)),
             "priority": max(1, int(priority)),
+            "runtime_key": str(runtime_key or "").strip(),
         }
         effective_mode = str(serialization_mode or self._serialization_mode or "").strip().lower() or "legacy_v1"
         if bool(use_transport_payload) and should_use_raw_bytes_payload(
@@ -2000,6 +2023,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_id_prefix: str = "",
         timeout_hint_sec: int = 0,
         priority: int = 1,
+        runtime_key: str = "",
         serialization_mode: str = "",
     ) -> pb2.TaskSubmitItem:
         pool_client = self._pools[node_id]._client  # noqa: SLF001
@@ -2013,6 +2037,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 task_id=task_id,
                 timeout_hint_sec=max(0, int(timeout_hint_sec)),
                 priority=max(1, int(priority)),
+                runtime_key=str(runtime_key or "").strip(),
             )
         if self._is_local_session():
             return self._build_task_submit_item(
@@ -2021,6 +2046,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 task_id_prefix=task_id_prefix,
                 timeout_hint_sec=timeout_hint_sec,
                 priority=priority,
+                runtime_key=runtime_key,
                 serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
                 use_transport_payload=True,
             )
@@ -2030,6 +2056,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             task_id_prefix=task_id_prefix,
             timeout_hint_sec=timeout_hint_sec,
             priority=priority,
+            runtime_key=runtime_key,
             serialization_mode=serialization_mode,
             use_transport_payload=True,
         )
@@ -2177,6 +2204,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         items: Sequence[pb2.TaskSubmitItem],
         *,
         job_id: str = "",
+        timeout_sec: Optional[float] = None,
     ) -> pb2.SubmitTasksResponse:
         if not items:
             return pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[], node_credit=0)
@@ -2204,7 +2232,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         rejected: List[pb2.TaskRejected] = []
         node_credit = 0
         for batch in batches:
-            resp = pool.submit_tasks(batch, job_id=str(job_id or self.job_id).strip())
+            submit_kwargs = {"job_id": str(job_id or self.job_id).strip()}
+            if timeout_sec is not None:
+                submit_kwargs["timeout_sec"] = max(0.1, float(timeout_sec))
+            try:
+                resp = pool.submit_tasks(batch, **submit_kwargs)
+            except TypeError as exc:
+                if "timeout_sec" not in submit_kwargs or "timeout_sec" not in str(exc):
+                    raise
+                submit_kwargs.pop("timeout_sec", None)
+                resp = pool.submit_tasks(batch, **submit_kwargs)
             self._register_pending_task_ids(resp.accepted, node_id=node_id)
             accepted.extend(resp.accepted)
             rejected.extend(resp.rejected)
@@ -2216,11 +2253,17 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         grouped: Dict[str, List[pb2.TaskSubmitItem]],
         *,
         job_id: str = "",
+        timeout_sec: Optional[float] = None,
     ) -> pb2.SubmitTasksResponse:
         accepted: List[pb2.TaskAccepted] = []
         rejected: List[pb2.TaskRejected] = []
         for node_id, items in grouped.items():
-            resp = self._submit_task_items_to_node(node_id, items, job_id=job_id)
+            resp = self._submit_task_items_to_node(
+                node_id,
+                items,
+                job_id=job_id,
+                timeout_sec=timeout_sec,
+            )
             accepted.extend(resp.accepted)
             rejected.extend(resp.rejected)
         return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
@@ -2239,7 +2282,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         runtime_key: str = "",
         serialization_mode: str = "",
     ) -> pb2.SubmitTasksResponse:
-        del timeout_sec, runtime_key
         if self._is_local_session():
             effective_serialization_mode = "legacy_v1"
         else:
@@ -2272,11 +2314,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     task_id_prefix=task_id_prefix,
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
+                    runtime_key=str(runtime_key or "").strip(),
                     serialization_mode=effective_serialization_mode,
                 )
             )
         try:
-            resp = self._submit_grouped_task_items(grouped, job_id=job_id)
+            resp = self._submit_grouped_task_items(
+                grouped,
+                job_id=job_id,
+                timeout_sec=max(0.1, float(timeout_sec)),
+            )
         except Exception as exc:
             for node_id in grouped:
                 self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)

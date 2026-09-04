@@ -75,11 +75,10 @@ def _resolve_bind(bind: str, *, remote_hint: str = "") -> str:
 
 
 def build_infocenter_server(bind: str, *, max_workers: int = 32) -> InfoCenterHttpServer:
-    if int(max_workers or 0) != 32:
-        logger.warning("InfoCenterHttpServer does not support max_workers; ignoring %s", max_workers)
     server = InfoCenterHttpServer(
         bind=bind,
         state=InfoCenterState(heartbeat_interval_sec=5, profiles_path=_default_infocenter_profiles_path()),
+        max_workers=max_workers,
     )
     return server
 
@@ -90,6 +89,7 @@ def build_controlplane_server(
     gateway_refresh_interval_sec: float = 3.0,
     gateway_failure_threshold: int = 3,
     gateway_open_sec: float = 5.0,
+    max_workers: int = 32,
 ) -> InfoCenterHttpServer:
     info_state = InfoCenterState(heartbeat_interval_sec=5, profiles_path=_default_infocenter_profiles_path())
     job_queue = JobQueueManager()
@@ -129,6 +129,7 @@ def build_controlplane_server(
         state=info_state,
         gateway_app=gateway_app,
         job_queue=job_queue,
+        max_workers=max_workers,
     )
 
 
@@ -139,6 +140,7 @@ def build_gateway_server(
     gateway_refresh_interval_sec: float = 3.0,
     gateway_failure_threshold: int = 3,
     gateway_open_sec: float = 5.0,
+    max_workers: int = 32,
 ) -> GatewayHttpServer:
     if not infocenter_addr:
         raise ValueError("infocenter_addr is required for gateway role")
@@ -156,6 +158,7 @@ def build_gateway_server(
             allow_private_addrs=allow_private,
             controlplane_target=infocenter_addr,
         ),
+        max_workers=max_workers,
     )
 
 
@@ -207,7 +210,6 @@ def build_nodecontrol_server(
     on_service_routes_changed: Optional[Callable[[], None]] = None,
     api_token: str = "",
 ) -> Tuple[NodeControlHttpServer, NodeControlState]:
-    del max_workers
     state = NodeControlState(
         node_id=node_id,
         artifact_dir=artifact_dir or _default_nodecontrol_artifact_dir(bind=bind, node_id=node_id),
@@ -225,6 +227,7 @@ def build_nodecontrol_server(
         state=state,
         on_service_routes_changed=on_service_routes_changed,
         api_token=api_token,
+        max_workers=max_workers,
     )
     return server, state
 
@@ -347,6 +350,7 @@ def main() -> None:
             gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
             gateway_failure_threshold=args.gateway_failure_threshold,
             gateway_open_sec=args.gateway_open_sec,
+            max_workers=args.max_workers,
         )
         _wait_until_stopped(server, on_stop=lambda: None)
         return
@@ -365,6 +369,7 @@ def main() -> None:
             gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
             gateway_failure_threshold=args.gateway_failure_threshold,
             gateway_open_sec=args.gateway_open_sec,
+            max_workers=args.max_workers,
         )
         _wait_until_stopped(server, on_stop=lambda: None)
         return

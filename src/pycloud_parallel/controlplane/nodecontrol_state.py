@@ -172,6 +172,7 @@ RESOURCE_LIVENESS_REFRESH_INTERVAL_SEC = 200.0
 CREATE_REQUEST_WAIT_TIMEOUT_SEC = 300.0
 CREATE_REQUEST_MAX_RECORDS_PER_KIND = 200
 DEPENDENCY_FAILURE_STATUS = "FAILED_DEPENDENCY"
+DEFAULT_INACTIVE_RESOURCE_HISTORY_LIMIT = 100
 
 
 def _path(value: Any = ".") -> Path:
@@ -321,6 +322,7 @@ class NodeControlState(NodeRuntimeBase):
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._pool_tasks: Dict[str, TaskState] = {}
+        self._active_pool_task_ids: set[str] = set()
         self._pool_task_reserved_ids: set[str] = set()
         self._codes: Dict[str, CodeArtifact] = {}
         self._objects: Dict[str, ObjectArtifact] = {}
@@ -780,6 +782,7 @@ class NodeControlState(NodeRuntimeBase):
             task.result = None
             task.error_type = "TaskPoolStopped"
             task.error_message = str(reason or "task pool stopped")
+            self._active_pool_task_ids.discard(str(task.task_id or "").strip())
             pool.returned_count += 1
             failed_count += 1
             result_hook.push(pool_id, task.as_result())
@@ -2236,9 +2239,7 @@ class NodeControlState(NodeRuntimeBase):
 
     def _node_queue_occupancy_locked(self) -> int:
         service_inflight = sum(self._service_inflight_locked(session) for session in self._services.values())
-        pool_active = sum(
-            1 for task in self._pool_tasks.values() if self._pool_task_is_active_status(int(task.status or 0))
-        )
+        pool_active = len(self._active_pool_task_ids)
         return service_inflight + pool_active + len(self._pool_task_reserved_ids)
 
     def task_pool_worker_used(self) -> int:
@@ -2301,6 +2302,10 @@ class NodeControlState(NodeRuntimeBase):
             if pool is None:
                 raise KeyError("task pool not found")
             return pool
+
+    def get_task_pool_status(self, pool_id: str) -> TaskPoolState:
+        """Compatibility accessor returning the live task-pool state object."""
+        return self.task_pool(pool_id)
 
     def task_pool_status_info(self, pool_id: str) -> Dict[str, object]:
         pool = self.task_pool(pool_id)
@@ -4473,12 +4478,14 @@ class NodeControlState(NodeRuntimeBase):
                         continue
                     self._pool_task_reserved_ids.discard(task_id)
                     self._pool_tasks[task_id] = record
+                    self._active_pool_task_ids.add(task_id)
             except Exception as exc:
                 with self._cv:
                     self._pool_task_reserved_ids.discard(task_id)
                     current = self._pool_tasks.get(task_id)
                     if record is not None and current is record:
                         self._pool_tasks.pop(task_id, None)
+                        self._active_pool_task_ids.discard(task_id)
                 rejected.append(
                     pb2.TaskRejected(
                         task_id=task_id,
@@ -4514,6 +4521,7 @@ class NodeControlState(NodeRuntimeBase):
                     current = self._pool_tasks.get(task_id)
                     if current is record:
                         self._pool_tasks.pop(task_id, None)
+                        self._active_pool_task_ids.discard(task_id)
                 rejected.append(
                     pb2.TaskRejected(
                         task_id=task_id,
@@ -4564,6 +4572,7 @@ class NodeControlState(NodeRuntimeBase):
                         continue
                     if self._pool_task_is_terminal_status(int(task.status or 0)):
                         self._pool_tasks.pop(task_id, None)
+                        self._active_pool_task_ids.discard(task_id)
         log_payload_flow(
             "taskpool_pull_results_state",
             pool_id=str(pool_id or "").strip(),
@@ -4641,6 +4650,7 @@ class NodeControlState(NodeRuntimeBase):
                 task.cancel_requested = True
                 if task.status == pb2.TASK_STATUS_QUEUED:
                     task.status = pb2.TASK_STATUS_CANCELLED
+                    self._active_pool_task_ids.discard(str(task.task_id or "").strip())
                     task.finished_at = utc_now()
                     task.error_type = "Cancelled"
                     task.error_message = reason or f"cancelled by pool job_id={normalized_job_id}"
@@ -5605,9 +5615,14 @@ class NodeControlState(NodeRuntimeBase):
 
     def metrics(self) -> Dict[str, int]:
         with self._lock:
-            queued = sum(1 for task in self._pool_tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
+            active_tasks = [
+                self._pool_tasks[task_id]
+                for task_id in tuple(self._active_pool_task_ids)
+                if task_id in self._pool_tasks
+            ]
+            queued = sum(1 for task in active_tasks if task.status == pb2.TASK_STATUS_QUEUED)
             service_inflight = sum(self._service_inflight_locked(session) for session in self._services.values())
-            pool_inflight = sum(1 for task in self._pool_tasks.values() if task.status == pb2.TASK_STATUS_RUNNING)
+            pool_inflight = sum(1 for task in active_tasks if task.status == pb2.TASK_STATUS_RUNNING)
             inflight = service_inflight + pool_inflight
             credit = max(0, self.queue_capacity - (queued + inflight))
             return {
@@ -5661,7 +5676,11 @@ class NodeControlState(NodeRuntimeBase):
         queued = 0
         pool_inflight = 0
         now_ts = utc_now().timestamp()
-        for task in self._pool_tasks.values():
+        for task_id in tuple(self._active_pool_task_ids):
+            task = self._pool_tasks.get(task_id)
+            if task is None:
+                self._active_pool_task_ids.discard(task_id)
+                continue
             status = int(task.status or 0)
             if status == int(pb2.TASK_STATUS_RUNNING):
                 pool_inflight += 1
@@ -5687,6 +5706,46 @@ class NodeControlState(NodeRuntimeBase):
             "queued": queued,
             "pool_inflight": pool_inflight,
         }
+
+    def _prune_inactive_resource_history_locked(self) -> None:
+        try:
+            limit = max(
+                0,
+                int(
+                    str(
+                        os.getenv(
+                            "PYCLOUD_NODE_INACTIVE_RESOURCE_HISTORY_LIMIT",
+                            DEFAULT_INACTIVE_RESOURCE_HISTORY_LIMIT,
+                        )
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            limit = DEFAULT_INACTIVE_RESOURCE_HISTORY_LIMIT
+
+        stopped_services = [
+            service_id
+            for service_id, session in self._services.items()
+            if session.status == pb2.SERVICE_STATUS_STOPPED
+        ]
+        stopped_pools = [
+            pool_id
+            for pool_id, pool in self._task_pools.items()
+            if not pool.is_running()
+        ]
+        for service_id in stopped_services[: max(0, len(stopped_services) - limit)]:
+            self._services.pop(service_id, None)
+        for pool_id in stopped_pools[: max(0, len(stopped_pools) - limit)]:
+            self._task_pools.pop(pool_id, None)
+            self._pool_result_hook.clear_client(str(pool_id or ""))
+            stale_task_ids = [
+                task_id
+                for task_id, task in self._pool_tasks.items()
+                if str(task.client_id or "").strip() == str(pool_id or "").strip()
+            ]
+            for task_id in stale_task_ids:
+                self._pool_tasks.pop(task_id, None)
+                self._active_pool_task_ids.discard(task_id)
 
     def _collect_registrar_timing_metadata_locked(self) -> Dict[str, str]:
         service_timing_payload: Dict[str, object] = {}
@@ -5729,22 +5788,30 @@ class NodeControlState(NodeRuntimeBase):
         include_inventory: bool = True,
     ) -> Dict[str, object]:
         with self._lock:
-            service_rows = [
-                (session, self._service_inflight_locked(session))
-                for session in self._services.values()
-                if include_stopped or session.status != pb2.SERVICE_STATUS_STOPPED
-            ]
+            self._prune_inactive_resource_history_locked()
             task_stats = self._collect_registrar_task_stats_locked()
             inflight_by_pool = dict(task_stats["inflight_by_pool"])
             runtime_stats = dict(task_stats["runtime_stats"])
             queued = int(task_stats["queued"] or 0)
             pool_inflight = int(task_stats["pool_inflight"] or 0)
-            task_pool_rows = [
-                (pool, inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)))
-                for pool in self._task_pools.values()
-                if pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()
-            ]
-            service_inflight = sum(in_flight for _session, in_flight in service_rows)
+            service_rows = []
+            task_pool_rows = []
+            if include_inventory:
+                service_rows = [
+                    (session, self._service_inflight_locked(session))
+                    for session in self._services.values()
+                    if include_stopped or session.status != pb2.SERVICE_STATUS_STOPPED
+                ]
+                task_pool_rows = [
+                    (pool, inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)))
+                    for pool in self._task_pools.values()
+                    if pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()
+                ]
+            service_inflight = sum(
+                self._service_inflight_locked(session)
+                for session in self._services.values()
+                if session.is_running()
+            )
             active_service_workers = sum(
                 session.resource_snapshot().worker_count
                 for session in self._services.values()
@@ -5764,11 +5831,13 @@ class NodeControlState(NodeRuntimeBase):
                 "worker_capacity": self.worker_capacity,
                 "uptime_sec": int((utc_now() - self.started_at).total_seconds()),
             }
-            runtime_rows = [
-                (running, queued_count, last_used, runtime_key)
-                for runtime_key, (running, queued_count, last_used) in runtime_stats.items()
-            ]
-            runtime_rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+            runtime_rows = []
+            if include_inventory:
+                runtime_rows = [
+                    (running, queued_count, last_used, runtime_key)
+                    for runtime_key, (running, queued_count, last_used) in runtime_stats.items()
+                ]
+                runtime_rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
             service_timing_metadata = self._collect_registrar_timing_metadata_locked() if include_inventory else {}
             service_worker_used = active_service_workers + max(0, int(self._service_worker_reserved))
             task_pool_worker_used = active_task_pool_workers + max(0, int(self._task_pool_worker_reserved))
@@ -5907,6 +5976,7 @@ class NodeControlState(NodeRuntimeBase):
                             task.result = {} if result is None else result
                         task.error_type = ""
                         task.error_message = ""
+                    self._active_pool_task_ids.discard(task_id)
                     queued_result = task.as_result()
                     pool.returned_count += 1
                     timing_event = self._record_task_pool_timing_locked(

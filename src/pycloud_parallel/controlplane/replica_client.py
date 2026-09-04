@@ -157,13 +157,17 @@ class NativeTaskPoolClient:
         tasks: Sequence[pb2.TaskSubmitItem],
         *,
         job_id: str = "",
+        timeout_sec: Optional[float] = None,
     ) -> pb2.SubmitTasksResponse:
-        return self._client.submit_pool_tasks(
+        kwargs = dict(
             pool_id=self.pool_id,
             pool_token=self.pool_token,
             tasks=tasks,
             job_id=job_id,
         )
+        if timeout_sec is not None:
+            kwargs["timeout_sec"] = timeout_sec
+        return self._client.submit_pool_tasks(**kwargs)
 
     def pull_results(
         self,

@@ -297,7 +297,7 @@ def test_connected_service_map_requires_arg_name_for_non_dict_values():
         client.close()
 
 
-def test_connected_service_unordered_requires_mapping_payloads():
+def test_connected_service_unordered_wraps_scalar_payloads_as_value():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
@@ -306,8 +306,15 @@ def test_connected_service_unordered_requires_mapping_payloads():
     )
     try:
         client._discovered_methods = ["square"]
-        with pytest.raises(TypeError, match="mapping payloads"):
-            list(client.square.unordered([1, 2, 3]))
+        with patch.object(
+            type(client),
+            "call_balanced",
+            side_effect=lambda _method, payload, **_kwargs: (
+                "node-1",
+                {"ok": True, "data": payload["value"] * 10},
+            ),
+        ):
+            assert sorted(client.square.unordered([1, 2, 3])) == [(0, 10), (1, 20), (2, 30)]
     finally:
         client.close()
 

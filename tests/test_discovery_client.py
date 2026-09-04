@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from concurrent import futures
 import shutil
+import threading
 import time
 from collections import Counter
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Tuple
 from unittest.mock import patch
 
@@ -515,7 +516,7 @@ class TestDiscoveryConnectedService:
         uploads = []
 
         def fake_estimate(value):
-            return 600000 if isinstance(value, str) else 16
+            return 64 * 1024 * 1024 if isinstance(value, str) else 16
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
@@ -562,7 +563,7 @@ class TestDiscoveryConnectedService:
         uploads = []
 
         def fake_estimate(value):
-            return 600000 if isinstance(value, str) else 16
+            return 64 * 1024 * 1024 if isinstance(value, str) else 16
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
@@ -624,6 +625,41 @@ class TestDiscoveryConnectedService:
 
             with patch.object(client, "acall_all", return_value=[("svc-demo", {"ok": True, "data": {"y": 49}}, None)]):
                 assert asyncio.run(_run()) == [("svc-demo", {"y": 49}, None)]
+        finally:
+            client.close()
+
+    def test_broadcast_calls_every_available_discovery_route_with_bounded_concurrency(self):
+        service_name = "svc-broadcast-all"
+        routes = [_demo_route_variant(index, service_name=service_name) for index in range(1, 5)]
+        client = _connect_discovery_service(service_name=service_name, validate_on_init=False)
+        client._route_cache._snapshots[service_name] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name=service_name,
+            routes=routes,
+        )
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def _call(route, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return {"ok": True, "data": {"route": route.service_id}}
+
+        try:
+            with (
+                patch.object(type(client), "_prepare_discovery_route_payload", side_effect=lambda _route, payload: payload),
+                patch.object(client._client_mod, "_call_route_http", side_effect=_call),
+            ):
+                results = asyncio.run(client.acall_all("square", {"x": 7}, max_concurrency=2))
+            assert {node_id for node_id, _response, error in results if error is None} == {
+                route.node_instance_id for route in routes
+            }
+            assert peak == 2
         finally:
             client.close()
 
@@ -782,9 +818,14 @@ def test_discovery_client_retries_second_route_when_first_route_is_broken(tmp_pa
         controlplane.stop()
 
 
-def test_discovery_client_fetches_large_dataframe_result(tmp_path):
+def test_discovery_client_fetches_large_dataframe_result(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
     pytest.importorskip("pyarrow")
     pd = pytest.importorskip("pandas")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "1024")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
 
     controlplane = build_controlplane_server("127.0.0.1:0")
     controlplane.start()
@@ -900,6 +941,190 @@ def test_discovery_route_cache_defaults_to_predicted_busy():
         assert cache.select_route("svc-demo", strategy="least_inflight").service_id == "svc-low-inflight"
     finally:
         cache.stop()
+
+
+def test_discovery_route_cache_filters_method_failures_from_fresh_snapshot_without_rpc():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    allowed = _demo_route_variant(1)
+    blocked = replace(_demo_route_variant(2), method_failures={"square": {"reason": "missing dependency"}})
+    cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name="svc-demo",
+        routes=[allowed, blocked],
+    )
+    try:
+        with patch.object(InfoCenterClient, "list_service_routes", side_effect=AssertionError("unexpected refresh")):
+            routes = cache.refresh_for_method("svc-demo", method="square")
+        assert [route.service_id for route in routes] == [allowed.service_id]
+    finally:
+        cache.stop()
+
+
+def test_discovery_route_cache_single_flights_concurrent_stale_refreshes():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    route = _demo_route()
+
+    def _list_routes(_client, **_kwargs):
+        time.sleep(0.05)
+        return [route]
+
+    try:
+        with patch.object(InfoCenterClient, "list_service_routes", autospec=True, side_effect=_list_routes) as mocked:
+            with futures.ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(lambda _idx: cache.get_routes("svc-demo"), range(8)))
+        assert mocked.call_count == 1
+        assert all([item.service_id for item in rows] == [route.service_id] for rows in results)
+    finally:
+        cache.stop()
+
+
+def test_discovery_route_cache_single_flight_propagates_owner_refresh_failure():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=1.0)
+    cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name="svc-demo",
+        routes=[_demo_route()],
+        refreshed_at=datetime.now(timezone.utc) - timedelta(seconds=30),
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fail_refresh(_client, **_kwargs):
+        started.set()
+        release.wait(timeout=1.0)
+        raise RuntimeError("infocenter unavailable")
+
+    try:
+        with patch.object(InfoCenterClient, "list_service_routes", autospec=True, side_effect=_fail_refresh):
+            with futures.ThreadPoolExecutor(max_workers=2) as executor:
+                owner = executor.submit(cache.refresh, "svc-demo", force=True)
+                assert started.wait(timeout=1.0)
+                waiter = executor.submit(cache.refresh, "svc-demo", force=True)
+                release.set()
+                with pytest.raises(RuntimeError, match="infocenter unavailable"):
+                    owner.result()
+                with pytest.raises(RuntimeError, match="failed to update snapshot"):
+                    waiter.result()
+    finally:
+        release.set()
+        cache.stop()
+
+
+def test_low_level_discovery_client_force_refreshes_after_cached_routes_exhausted():
+    old_route = _demo_route_variant(1)
+    new_route = _demo_route_variant(2)
+    client = DiscoveryServiceClient("127.0.0.1:50051", timeout_sec=1.0)
+    client._route_cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name="svc-demo",
+        routes=[old_route],
+    )
+    calls = []
+
+    def _call(route, **_kwargs):
+        calls.append(route.service_id)
+        if route.service_id == old_route.service_id:
+            raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "old route failed"})
+        return {"ok": True, "data": {"route": route.service_id}}
+
+    try:
+        with (
+            patch.object(InfoCenterClient, "list_service_routes", autospec=True, return_value=[new_route]) as refreshed,
+            patch(
+                "pycloud_parallel.controlplane.discovery_client.client_mod._prepare_remote_call_payload",
+                side_effect=lambda _clients, payload, **_kwargs: payload,
+            ),
+            patch("pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http", side_effect=_call),
+        ):
+            response = client.call(service_name="svc-demo", method="square", payload={"x": 2})
+        assert response["data"] == {"route": new_route.service_id}
+        assert calls == [old_route.service_id, new_route.service_id]
+        assert refreshed.call_count == 1
+    finally:
+        client.close()
+
+
+def test_connected_discovery_normal_call_uses_cached_route_without_infocenter_rpc():
+    route = _demo_route()
+    client = _connect_discovery_service(validate_on_init=False)
+    client._route_cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name="svc-demo",
+        routes=[route],
+    )
+    try:
+        with (
+            patch.object(InfoCenterClient, "list_service_routes", side_effect=AssertionError("unexpected refresh")),
+            patch.object(type(client), "_prepare_discovery_route_payload", side_effect=lambda _route, payload: payload),
+            patch.object(client._client_mod, "_call_route_http", return_value={"ok": True, "data": {"y": 49}}),
+        ):
+            node_id, response = client.call_balanced("square", {"x": 7}, refresh_status=False)
+        assert node_id == route.node_instance_id
+        assert response["data"] == {"y": 49}
+    finally:
+        client.close()
+
+
+def test_connected_discovery_empty_cached_snapshot_does_not_fallback_to_node_scan():
+    service_name = "svc-empty-cache"
+    client = _connect_discovery_service(service_name=service_name, validate_on_init=False)
+    client._route_cache._snapshots[service_name] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name=service_name,
+        routes=[],
+    )
+    try:
+        with patch.object(type(client), "_discover_routes_from_nodes", side_effect=AssertionError("unexpected node scan")):
+            assert client._discoverable_routes() == []  # noqa: SLF001
+    finally:
+        client.close()
+
+
+def test_connected_discovery_failure_refreshes_once_and_honors_max_attempts():
+    routes = [_demo_route_variant(index) for index in range(1, 4)]
+    client = _connect_discovery_service(validate_on_init=False)
+    client._route_cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name="svc-demo",
+        routes=routes,
+    )
+    try:
+        with (
+            patch.object(type(client), "_prepare_discovery_route_payload", side_effect=lambda _route, payload: payload),
+            patch.object(client._route_cache, "refresh", wraps=client._route_cache.refresh) as mocked_refresh,
+            patch.object(
+                InfoCenterClient,
+                "list_service_routes",
+                autospec=True,
+                return_value=routes,
+            ),
+            patch.object(
+                client._client_mod,
+                "_call_route_http",
+                side_effect=DiscoveryCallError(status_code=502, data={"ok": False, "error": "route failed"}),
+            ) as mocked_call,
+        ):
+            with pytest.raises(RuntimeError, match="2 attempt"):
+                client.call_balanced("square", {"x": 7}, refresh_status=False, max_attempts=2)
+        assert mocked_call.call_count == 2
+        assert sum(1 for call in mocked_refresh.call_args_list if call.kwargs.get("force")) == 1
+    finally:
+        client.close()
+
+
+def test_connected_discovery_explicit_refresh_fetches_routes_once():
+    service_name = "svc-explicit-refresh"
+    route = _demo_route(service_name=service_name)
+    client = _connect_discovery_service(service_name=service_name, validate_on_init=False)
+    client._route_cache._snapshots[service_name] = _ServiceRouteSnapshot(  # noqa: SLF001
+        service_name=service_name,
+        routes=[route],
+        refreshed_at=datetime.now(timezone.utc) - timedelta(seconds=30),
+    )
+    try:
+        with (
+            patch.object(InfoCenterClient, "list_service_routes", autospec=True, return_value=[route]) as mocked_routes,
+            patch.object(type(client), "_prepare_discovery_route_payload", side_effect=lambda _route, payload: payload),
+            patch.object(client._client_mod, "_call_route_http", return_value={"ok": True, "data": {"y": 49}}),
+        ):
+            client.call_balanced("square", {"x": 7}, refresh_status=True)
+        assert mocked_routes.call_count == 1
+    finally:
+        client.close()
 
 
 def test_discovery_route_cache_uses_local_inflight_before_infocenter_refresh():

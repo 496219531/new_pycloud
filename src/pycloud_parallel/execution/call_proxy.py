@@ -258,7 +258,7 @@ class _CallProxy:
         *,
         timeout_sec: float = 60.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
     ) -> None:
         self._method = method
         self._group = group
@@ -623,7 +623,7 @@ class _SyncCallProxy:
         *,
         timeout_sec: float = 60.0,
         strategy: str = "predicted_busy",
-        refresh_status: bool = True,
+        refresh_status: bool = False,
     ) -> None:
         self._method = method
         self._group = group

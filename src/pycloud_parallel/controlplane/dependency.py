@@ -42,6 +42,8 @@ _PACKAGED_PYTHON_FILE_SUFFIXES = frozenset({".py", ".pyd", ".so"})
 _RUNTIME_PACKAGE_ROOTS = frozenset({"pycloud_parallel"})
 _PACKAGE_CACHE_VERSION = 1
 _PACKAGE_CACHE_LOCK = threading.Lock()
+_PACKAGE_CACHE_DEFAULT_MAX_ENTRIES = 128
+_PACKAGE_CACHE_DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
 
 
 def _normalize_arcname(arcname: Path | str) -> str:
@@ -141,7 +143,10 @@ def _copy_cached_targz_if_available(cache_key: str, output_file: str) -> bool:
     if not cached_path.exists() or not cached_path.is_file():
         return False
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(cached_path), str(output_file))
+    try:
+        shutil.copyfile(str(cached_path), str(output_file))
+    except FileNotFoundError:
+        return False
     return True
 
 
@@ -158,6 +163,37 @@ def _store_cached_targz(cache_key: str, output_file: str) -> None:
     tmp_path = Path(tmp_name)
     shutil.copyfile(str(output_file), str(tmp_path))
     os.replace(str(tmp_path), str(cached_path))
+    _prune_package_cache(root)
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(str(os.getenv(name, "") or default)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _prune_package_cache(root: Path) -> None:
+    max_entries = _positive_env_int("PYCLOUD_PACKAGE_CACHE_MAX_ENTRIES", _PACKAGE_CACHE_DEFAULT_MAX_ENTRIES)
+    max_bytes = _positive_env_int("PYCLOUD_PACKAGE_CACHE_MAX_BYTES", _PACKAGE_CACHE_DEFAULT_MAX_BYTES)
+    entries = []
+    total_bytes = 0
+    for path in root.glob("*.tar.gz"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        size = max(0, int(stat.st_size))
+        total_bytes += size
+        entries.append((float(stat.st_mtime), path, size))
+    entries.sort(key=lambda item: item[0])
+    while entries and (len(entries) > max_entries or total_bytes > max_bytes):
+        _mtime, path, size = entries.pop(0)
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total_bytes = max(0, total_bytes - size)
 
 
 def _write_cached_deterministic_targz(entries: Iterable["_TarSourceEntry"], output_file: str, *, cache_scope: str) -> None:

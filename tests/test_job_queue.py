@@ -2414,7 +2414,8 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
     )
     captured = {}
 
-    def _fake_list_service_routes(self, *, service_name="", healthy_only=True, limit=500):
+    def _fake_list_service_routes(self, *, service_name="", healthy_only=True, limit=500, method=""):
+        del method
         captured["service_name"] = service_name
         captured["healthy_only"] = healthy_only
         captured["limit"] = limit

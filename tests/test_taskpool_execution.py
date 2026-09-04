@@ -2669,6 +2669,7 @@ def test_native_task_pool_session_keepalive_heartbeats_replicas_concurrently() -
         task_method="run",
         job_id="job-hb-concurrent",
     )
+    session._heartbeat_worker_count = 2  # noqa: SLF001
 
     session._active_replica_ids = {"node-slow", "node-good"}  # noqa: SLF001
     thread = threading.Thread(target=session._keepalive_loop, args=(0.01,), daemon=True)  # noqa: SLF001
@@ -2689,6 +2690,7 @@ def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(c
 
     started = threading.Event()
     release = threading.Event()
+    calls = {"value": 0, "active": 0, "max_active": 0}
 
     class _SlowPool:
         owner_client_id = "owner"
@@ -2697,9 +2699,15 @@ def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(c
 
         def heartbeat(self, *, seq: int = 0):
             del seq
+            calls["value"] += 1
+            calls["active"] += 1
+            calls["max_active"] = max(calls["max_active"], calls["active"])
             started.set()
-            release.wait(2.0)
-            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+            try:
+                release.wait(2.0)
+                return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+            finally:
+                calls["active"] -= 1
 
     session = TaskPool(
         pools={"node-slow": _SlowPool()},
@@ -2707,12 +2715,13 @@ def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(c
         task_method="run",
         job_id="job-single-hb",
     )
+    session._heartbeat_rpc_timeout_sec = lambda _replica: 0.1  # type: ignore[method-assign]  # noqa: SLF001
 
     with caplog.at_level(logging.WARNING):
         session._start_keepalive(interval_sec=0.01)  # noqa: SLF001
         try:
             assert started.wait(0.5)
-            deadline = time.time() + 1.5
+            deadline = time.time() + 1.0
             while time.time() < deadline:
                 if any("keepalive heartbeat pending" in record.getMessage() for record in caplog.records):
                     break
@@ -2720,6 +2729,15 @@ def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(c
             assert any("keepalive heartbeat pending" in record.getMessage() for record in caplog.records)
             assert session._hb_thread is not None  # noqa: SLF001
             assert session._hb_thread.is_alive()  # noqa: SLF001
+            time.sleep(0.2)
+            assert calls["value"] == 1
+            assert calls["max_active"] == 1
+            assert len(session._heartbeat_stale_pending) == 1  # noqa: SLF001
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and session._heartbeat_stale_pending:  # noqa: SLF001
+                time.sleep(0.02)
+            assert session._heartbeat_stale_pending == {}  # noqa: SLF001
         finally:
             release.set()
             session.close()
@@ -2840,11 +2858,10 @@ def test_native_task_pool_late_failure_does_not_probe_removed_replica() -> None:
     session.close()
 
 
-def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry() -> None:
+def test_native_task_pool_session_started_stuck_heartbeat_is_not_resubmitted() -> None:
     from pycloud_parallel import TaskPool
 
     first_started = threading.Event()
-    second_seen = threading.Event()
     release_first = threading.Event()
     calls = {"value": 0}
 
@@ -2861,7 +2878,6 @@ def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry()
                 first_started.set()
                 release_first.wait(3.0)
                 return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
-            second_seen.set()
             return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
 
     session = TaskPool(
@@ -2870,22 +2886,26 @@ def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry()
         task_method="run",
         job_id="job-stuck-hb",
     )
+    session._heartbeat_rpc_timeout_sec = lambda _replica: 0.1  # type: ignore[method-assign]  # noqa: SLF001
 
     session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
     try:
         assert first_started.wait(0.5)
-        assert second_seen.wait(2.5)
+        time.sleep(0.5)
+        assert calls["value"] == 1
         assert session.failed is False
     finally:
         release_first.set()
         session.close()
 
 
-def test_native_task_pool_session_stale_heartbeat_pending_is_bounded(caplog) -> None:
+def test_native_task_pool_session_stale_heartbeat_counts_against_worker_limit() -> None:
     from pycloud_parallel import TaskPool
 
-    started = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
     release = threading.Event()
+    calls: list[str] = []
 
     class _AlwaysStuckPool:
         owner_client_id = "owner"
@@ -2893,37 +2913,138 @@ def test_native_task_pool_session_stale_heartbeat_pending_is_bounded(caplog) -> 
         heartbeat_timeout_sec = 1
         heartbeat_failure_threshold = 1
 
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+
         def heartbeat(self, *, seq: int = 0):
             del seq
-            started.set()
+            calls.append(self.node_id)
+            if len(calls) == 1:
+                first_started.set()
+            else:
+                second_started.set()
             release.wait(5.0)
             return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
 
     session = TaskPool(
         pools={
-            "node-stuck-1": _AlwaysStuckPool(),
-            "node-stuck-2": _AlwaysStuckPool(),
+            "node-stuck-1": _AlwaysStuckPool("node-stuck-1"),
+            "node-stuck-2": _AlwaysStuckPool("node-stuck-2"),
         },
         nodes={},
         task_method="run",
         job_id="job-stale-hb",
     )
-    session._stale_heartbeat_pending_limit = lambda: 1  # type: ignore[method-assign]  # noqa: SLF001
+    session._heartbeat_worker_count = 1  # noqa: SLF001
+    session._heartbeat_rpc_timeout_sec = lambda _replica: 0.1  # type: ignore[method-assign]  # noqa: SLF001
 
-    with caplog.at_level(logging.WARNING):
+    session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
+    try:
+        assert first_started.wait(0.5)
+        time.sleep(0.5)
+        assert not second_started.is_set()
+        assert len(calls) == 1
+        assert len(session._heartbeat_stale_pending) == 1  # noqa: SLF001
+        assert session.failed is False
+    finally:
+        release.set()
+        session.close()
+
+
+def test_native_task_pool_session_low_heartbeat_worker_count_is_fair() -> None:
+    from pycloud_parallel import TaskPool
+
+    calls = {"node-1": 0, "node-2": 0, "node-3": 0}
+    all_seen_twice = threading.Event()
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            calls[self.node_id] += 1
+            if all(count >= 2 for count in calls.values()):
+                all_seen_twice.set()
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={node_id: _Pool(node_id) for node_id in calls},
+        nodes={},
+        task_method="run",
+        job_id="job-heartbeat-fairness",
+    )
+    session._heartbeat_worker_count = 1  # noqa: SLF001
+
+    session._start_keepalive(interval_sec=0.01)  # noqa: SLF001
+    try:
+        assert all_seen_twice.wait(1.0)
+        assert max(calls.values()) - min(calls.values()) <= 1
+    finally:
+        session.close()
+
+
+def test_heartbeat_threads_are_bounded_across_sessions(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution import base as execution_base
+
+    monkeypatch.setattr(execution_base, "_HEARTBEAT_GLOBAL_SLOTS", threading.BoundedSemaphore(2))
+    release = threading.Event()
+    started = [threading.Event() for _ in range(3)]
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 100
+
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            started[self.index].set()
+            release.wait(timeout=3.0)
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True)
+
+    sessions = [
+        TaskPool(pools={f"node-{index}": _Pool(index)}, nodes={}, task_method="run", job_id=f"job-{index}")
+        for index in range(3)
+    ]
+    for index, session in enumerate(sessions):
+        session._heartbeat_rpc_timeout_sec = lambda _replica: 0.1  # type: ignore[method-assign]  # noqa: SLF001
         session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
-        try:
-            assert started.wait(0.5)
-            deadline = time.monotonic() + 6.0
-            while time.monotonic() < deadline:
-                if any("stale heartbeat pending limit reached" in record.getMessage() for record in caplog.records):
-                    break
-                time.sleep(0.05)
-            assert any("stale heartbeat pending limit reached" in record.getMessage() for record in caplog.records)
-            assert session.failed is False
-        finally:
-            release.set()
+        if index < 2:
+            assert started[index].wait(timeout=1.0)
+    try:
+        time.sleep(0.2)
+        assert not started[2].is_set()
+        assert len([thread for thread in threading.enumerate() if thread.name == "task_pool-hb-call"]) == 2
+        release.set()
+        assert started[2].wait(timeout=1.0)
+    finally:
+        release.set()
+        for session in sessions:
             session.close()
+
+
+def test_single_session_cannot_claim_all_global_heartbeat_slots(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution import base as execution_base
+
+    monkeypatch.setattr(execution_base, "HEARTBEAT_GLOBAL_MAX_INFLIGHT", 4)
+    pools = {
+        f"node-{index}": SimpleNamespace(worker_count=1, alive_workers=1, failed=False)
+        for index in range(8)
+    }
+    session = TaskPool(pools=pools, nodes={}, task_method="run", job_id="global-fair-share")
+    session._heartbeat_worker_count = 8  # noqa: SLF001
+
+    assert session._heartbeat_max_workers(len(pools)) == 2  # noqa: SLF001
 
 
 def test_native_task_pool_client_heartbeat_uses_short_rpc_timeout() -> None:

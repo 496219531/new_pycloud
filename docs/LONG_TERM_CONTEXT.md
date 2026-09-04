@@ -83,7 +83,7 @@ V1 公开概念固定为：
 2. `PYCLOUD_DATAREF_UPLOAD_STRATEGY` 默认 `upload_once`，旧 `fanout` 只作为显式回滚模式保留
 3. `PYCLOUD_JOBQUEUE_RESOLVE_REFS` 默认 `defer_to_worker`，job-orch 不提前 materialize 业务 `DataRef`
 4. `PYCLOUD_DATAREF_RESOLUTION` 默认 `remote_fetch`，worker 本地 miss 后按 locator/registry 拉取、校验并缓存
-5. `PYCLOUD_GATEWAY_DATAREF_RELAY` 仍默认 `eager`；gateway_public 的外部 DataRef locator 信任边界后续单独收口
+5. `PYCLOUD_GATEWAY_DATAREF_RELAY` 默认 `lazy`；显式 `eager` 使用临时文件流式中转，不整包物化 bytes
 
 ## 6. 动态补偿与失败可观测性基线
 
@@ -190,7 +190,7 @@ V1 公开概念固定为：
 2. `timing_metrics` 字段名保持兼容，`/ops` 页面展示不回归
 3. object upload 的四条路径行为保持一致：file/bytes 与 precheck/single-pass 都必须继续覆盖
 4. `JobQueue` 的 `pool_action`、`pool_prepare_ms`、`warmup_ms`、`running_tasks_ms`、`first_result_wait_ms` 等 timing 字段不能丢
-5. artifact packaging 的 `include_tests` 默认值先集中管理，是否切到 `False` 作为单独性能优化决策处理
+5. artifact packaging 默认排除 tests；仅在 `PYCLOUD_PACKAGE_INCLUDE_TESTS=true` 时显式包含
 
 ### 9.3 验收建议
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 from pycloud_parallel.data.ref import DataRef
@@ -165,6 +166,71 @@ def test_gateway_lazy_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, monke
     assert relayed.control_addr == "node-a:50061"
     assert _resolve_single_data_ref(relayed, object_dir=str(tmp_path)) == blob
     assert remote_calls == [("node-a:50061", object_id)]
+
+
+def test_gateway_eager_ref_relay_streams_through_file(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_GATEWAY_DATAREF_RELAY", "eager")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"gateway eager streaming payload"
+    object_id = _object_id(blob)
+    original = DataRef(ref_id=object_id, storage_id=object_id, format="bin", size_bytes=len(blob))
+    route = SimpleNamespace(control_addr="node-b:50062", node_id="node-b", node_instance_id="node-b-inst")
+    calls = []
+
+    class _Client:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_to_file(self, *, object_id, target_path):
+            calls.append(("download_file", self.target, object_id))
+            Path(target_path).write_bytes(blob)
+
+        def download_object_bytes(self, **_kwargs):
+            raise AssertionError("eager relay must not materialize source bytes")
+
+        def upload_object_from_file(self, *, file_path, format):
+            calls.append(("upload_file", self.target, Path(file_path).read_bytes(), format))
+            return DataRef(ref_id=object_id, storage_id=object_id, format=format, size_bytes=len(blob))
+
+        def upload_object_from_bytes(self, **_kwargs):
+            raise AssertionError("eager relay must not materialize target bytes")
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.gateway_upload.resolve_data_ref",
+        lambda ref, **_kwargs: ResolvedDataRef(
+            ref=ref,
+            control_addr="node-a:50061",
+            node_id="node-a",
+            node_instance_id="node-a-inst",
+            locator_kind="node_control",
+            locator_token="node-a:50061",
+            replicas=(),
+        ),
+    )
+    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_upload.NodeControlClient", _Client)
+
+    relayed = relay_data_ref_v1(
+        route=route,
+        data_ref=original,
+        registry_target="infocenter:50051",
+        timeout_sec=1.0,
+    )
+
+    assert relayed.control_addr == "node-b:50062"
+    assert calls == [
+        ("download_file", "node-a:50061", object_id),
+        ("upload_file", "node-b:50062", blob, "bin"),
+    ]
 
 
 def test_jobqueue_deferred_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, monkeypatch, request):

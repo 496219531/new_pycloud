@@ -8,15 +8,16 @@ task-pool submit/results keep their own business protocols on top.
 """
 
 import json
+import http.client
 import socket
 from dataclasses import dataclass, field
 from http.client import RemoteDisconnected
 from typing import Dict, Optional, Sequence, Tuple
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client_transport import _normalize_http_response_body
+from pycloud_parallel.controlplane.http_connection_pool import pooled_http_request
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
@@ -32,6 +33,7 @@ class RuntimeTransportRequest:
     timeout_sec: float = 10.0
     method: str = "POST"
     headers: Dict[str, str] = field(default_factory=dict)
+    retry_connection_error: Optional[bool] = None
 
 
 def _json_bytes(data: Dict[str, object]) -> bytes:
@@ -96,24 +98,28 @@ def runtime_http_request(
         raise ValueError("request.mode must be json or binary_sidecar")
 
     url = f"{base_url.rstrip('/')}{request.path}"
-    req = Request(
-        url,
-        method=request.method.upper(),
-        data=raw,
-        headers=headers,
-    )
     try:
-        with urlopen(req, timeout=max(0.1, float(request.timeout_sec))) as resp:
-            parsed = json.loads((resp.read() or b"{}").decode("utf-8") or "{}")
-    except HTTPError as exc:
+        response = pooled_http_request(
+            url=url,
+            method=request.method,
+            body=raw,
+            headers=headers,
+            timeout_sec=request.timeout_sec,
+            retry_connection_error=request.retry_connection_error,
+        )
         try:
-            parsed = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-        except Exception:
-            parsed = {"ok": False, "error": exc.reason}
-        raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
-    except URLError as exc:
+            parsed = json.loads((response.body or b"{}").decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            if response.status >= 400:
+                raise RuntimeError(response.reason or f"HTTP {response.status}") from exc
+            raise RuntimeError(f"invalid JSON response from {urlparse(url).netloc or url}: {exc}") from exc
+        if response.status >= 400:
+            raise RuntimeError(str(parsed.get("error", response.reason)))
+    except RuntimeError:
+        raise
+    except (OSError, http.client.HTTPException) as exc:
         raise _friendly_runtime_http_error(url=url, exc=exc) from exc
-    except RemoteDisconnected as exc:
+    except URLError as exc:
         raise _friendly_runtime_http_error(url=url, exc=exc) from exc
     normalized = _normalize_http_response_body(parsed, control_addr=control_addr)
     if normalized.get("ok", False) is False:
@@ -135,24 +141,27 @@ def runtime_http_request_for_binary_sidecar_response(
         headers.setdefault("Content-Type", "application/json; charset=utf-8")
     headers.setdefault("Accept", "application/octet-stream")
     url = f"{base_url.rstrip('/')}{request.path}"
-    req = Request(
-        url,
-        method=request.method.upper(),
-        data=raw,
-        headers=headers,
-    )
     try:
-        with urlopen(req, timeout=max(0.1, float(request.timeout_sec))) as resp:
-            meta, body = unpack_binary_sidecar(resp.read() or b"")
-    except HTTPError as exc:
-        try:
-            parsed = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-        except Exception:
-            parsed = {"ok": False, "error": exc.reason}
-        raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
-    except URLError as exc:
+        response = pooled_http_request(
+            url=url,
+            method=request.method,
+            body=raw,
+            headers=headers,
+            timeout_sec=request.timeout_sec,
+            retry_connection_error=request.retry_connection_error,
+        )
+        if response.status >= 400:
+            try:
+                parsed = json.loads((response.body or b"{}").decode("utf-8") or "{}")
+            except Exception:
+                parsed = {"ok": False, "error": response.reason}
+            raise RuntimeError(str(parsed.get("error", response.reason)))
+        meta, body = unpack_binary_sidecar(response.body or b"")
+    except RuntimeError:
+        raise
+    except (OSError, http.client.HTTPException) as exc:
         raise _friendly_runtime_http_error(url=url, exc=exc) from exc
-    except RemoteDisconnected as exc:
+    except URLError as exc:
         raise _friendly_runtime_http_error(url=url, exc=exc) from exc
     normalized_meta = _normalize_http_response_body(meta, control_addr=control_addr)
     if normalized_meta.get("ok", False) is False:

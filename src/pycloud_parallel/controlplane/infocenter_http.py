@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -21,6 +21,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.data.ref import DataRef, coerce_data_ref
+from pycloud_parallel.controlplane.bounded_http_server import (
+    BoundedThreadPoolHTTPServer,
+    DEFAULT_HTTP_MAX_WORKERS,
+    DEFAULT_HTTP_QUEUE_CAPACITY,
+)
 from pycloud_parallel.controlplane.config import get_infocenter_http_body_limit_bytes
 from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.data_plane_http import DataPlaneHttpApp
@@ -247,6 +252,8 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
         ordered = sorted(
             items,
             key=lambda svc: (
+                int(getattr(svc, "status", 0) == pb2.SERVICE_STATUS_RUNNING),
+                int(not str(getattr(svc, "stop_reason", "") or "").strip()),
                 getattr(svc, "lease_expire_at", utc_now()),
                 int(getattr(svc, "alive_workers", 0) or 0),
                 int(getattr(svc, "worker_count", 0) or 0),
@@ -1402,6 +1409,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         current_entry = active_entries[0] if active_entries else primary
         current_item = current_entry["item"]
         current_resource = current_item.get("primary")
+        service_id_text = html.escape(str(current_item["service_id"]) or "-")
+        if duplicate_count > 1:
+            service_id_text = f"{service_id_text} (+{duplicate_count - 1})"
         stop_reasons = [
             _failure_text_with_time(
                 entry["item"].get("stop_reason", ""),
@@ -1660,6 +1670,8 @@ class InfoCenterHttpServer:
         gateway_app: Optional[GatewayHttpApp] = None,
         job_queue: Optional[JobQueueManager] = None,
         auth_token: str = "",
+        max_workers: int = DEFAULT_HTTP_MAX_WORKERS,
+        queue_capacity: int = DEFAULT_HTTP_QUEUE_CAPACITY,
     ) -> None:
         self._bind = bind
         self.state = state or InfoCenterState()
@@ -1671,7 +1683,9 @@ class InfoCenterHttpServer:
         )
         env_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
         self.auth_token = str(auth_token or env_token or "").strip()
-        self._server: Optional[ThreadingHTTPServer] = None
+        self.max_workers = int(max_workers)
+        self.queue_capacity = int(queue_capacity)
+        self._server: Optional[BoundedThreadPoolHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
 
@@ -1686,6 +1700,13 @@ class InfoCenterHttpServer:
             gateway_app.start()
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def end_headers(self) -> None:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                super().end_headers()
+
             def do_POST(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 parts = [x for x in parsed.path.split("/") if x]
@@ -1967,6 +1988,7 @@ class InfoCenterHttpServer:
                     if "text/html" in (self.headers.get("Accept", "")):
                         self.send_response(303)
                         self.send_header("Location", "/ops")
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
                     self._send_json(200, {"ok": True})
@@ -2006,6 +2028,7 @@ class InfoCenterHttpServer:
                     if "text/html" in (self.headers.get("Accept", "")):
                         self.send_response(303)
                         self.send_header("Location", "/ops")
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
                     self._send_json(200, {"ok": True})
@@ -2337,12 +2360,12 @@ class InfoCenterHttpServer:
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
                 try:
+                    self.close_connection = True
                     self.send_response(int(response.status_code or 200))
                     self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
                     self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
                     for key, value in dict(response.extra_headers or {}).items():
-                        if str(key).lower() == "content-type":
+                        if str(key).lower() in {"connection", "content-length", "content-type"}:
                             continue
                         self.send_header(str(key), str(value))
                     if int(response.content_length or 0) > 0:
@@ -2371,7 +2394,7 @@ class InfoCenterHttpServer:
                     self.send_response(status_code)
                     self.send_header("Content-Type", content_type or "application/octet-stream")
                     for key, value in (extra_headers or {}).items():
-                        if str(key).lower() == "content-type":
+                        if str(key).lower() in {"connection", "content-length", "content-type"}:
                             continue
                         self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
@@ -2381,7 +2404,13 @@ class InfoCenterHttpServer:
                     if not _is_client_disconnect_error(exc):
                         raise
 
-        self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._server = BoundedThreadPoolHTTPServer(
+            (host, port),
+            _Handler,
+            max_workers=self.max_workers,
+            queue_capacity=self.queue_capacity,
+            thread_name_prefix="infocenter-http-worker",
+        )
         self._server.pycloud_owner = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, name="infocenter-http", daemon=True)
         self._thread.start()

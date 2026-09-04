@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from urllib.request import Request
 
 from pycloud_parallel.controlplane.client_transport import _call_route_http
+from pycloud_parallel.controlplane.http_connection_pool import BufferedHttpResponse
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
     should_use_http_raw_bytes_body,
@@ -38,22 +38,6 @@ def _policy(
         use_http_raw_bytes_body=use_http_raw_bytes_body,
         allow_pickle_stable="pickle_stable_v1" in allowed_modes,
     )
-
-
-class _FakeHttpResponse:
-    def __init__(self, body: bytes, headers: dict[str, str]) -> None:
-        self._body = body
-        self.headers = headers
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> "_FakeHttpResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        del exc_type, exc, tb
-        return None
 
 
 def test_transport_lane_follows_effective_policy_before_mode():
@@ -94,13 +78,13 @@ def test_http_lane_follows_effective_policy_before_mode():
 def test_call_route_http_uses_json_when_effective_policy_disables_http_bytes(monkeypatch):
     captured = {}
 
-    def _fake_urlopen(req, timeout):  # noqa: ARG001
-        captured["headers"] = dict(req.header_items())
-        captured["body"] = bytes(req.data or b"")
+    def _fake_request(**kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        captured["body"] = bytes(kwargs.get("body") or b"")
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
-        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
+        return BufferedHttpResponse(200, "OK", {"Content-Type": "application/json"}, body)
 
-    monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.urlopen", _fake_urlopen)
+    monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.pooled_http_request", _fake_request)
 
     _call_route_http(
         SimpleNamespace(http_base_url="http://127.0.0.1:18080/svc/demo", control_addr=""),
@@ -125,13 +109,13 @@ def test_call_route_http_uses_json_when_effective_policy_disables_http_bytes(mon
 def test_call_route_http_can_use_bytes_for_structured_when_policy_enables(monkeypatch):
     captured = {}
 
-    def _fake_urlopen(req, timeout):  # noqa: ARG001
-        captured["headers"] = dict(req.header_items())
-        captured["body"] = bytes(req.data or b"")
+    def _fake_request(**kwargs):
+        captured["headers"] = dict(kwargs.get("headers") or {})
+        captured["body"] = bytes(kwargs.get("body") or b"")
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
-        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
+        return BufferedHttpResponse(200, "OK", {"Content-Type": "application/json"}, body)
 
-    monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.urlopen", _fake_urlopen)
+    monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.pooled_http_request", _fake_request)
 
     _call_route_http(
         SimpleNamespace(http_base_url="http://127.0.0.1:18080/svc/demo", control_addr=""),
@@ -156,16 +140,16 @@ def test_call_route_http_can_use_bytes_for_structured_when_policy_enables(monkey
 def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
     captured = {}
 
-    def _fake_urlopen(req: Request, timeout):  # noqa: ARG001
-        captured["request"] = req
-        captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+    def _fake_request(**kwargs):
+        captured["url"] = kwargs["url"]
+        captured["body"] = json.loads((kwargs.get("body") or b"{}").decode("utf-8"))
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
-        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
+        return BufferedHttpResponse(200, "OK", {"Content-Type": "application/json"}, body)
 
     from pycloud_parallel.controlplane import client_transport_runtime
 
-    original_urlopen = client_transport_runtime.urlopen
-    client_transport_runtime.urlopen = _fake_urlopen
+    original_request = client_transport_runtime.pooled_http_request
+    client_transport_runtime.pooled_http_request = _fake_request
     try:
         client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
         NodeControlClient.call_service(
@@ -182,24 +166,24 @@ def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
             ),
         )
     finally:
-        client_transport_runtime.urlopen = original_urlopen
+        client_transport_runtime.pooled_http_request = original_request
 
-    assert captured["request"].full_url.endswith("/services/svc-1/call/run")
+    assert captured["url"].endswith("/services/svc-1/call/run")
     assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "pickle_stable_v1"
 
 
 def test_node_control_client_can_use_transport_lane_for_structured_mode():
     captured = {}
 
-    def _fake_urlopen(req: Request, timeout):  # noqa: ARG001
-        captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+    def _fake_request(**kwargs):
+        captured["body"] = json.loads((kwargs.get("body") or b"{}").decode("utf-8"))
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
-        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
+        return BufferedHttpResponse(200, "OK", {"Content-Type": "application/json"}, body)
 
     from pycloud_parallel.controlplane import client_transport_runtime
 
-    original_urlopen = client_transport_runtime.urlopen
-    client_transport_runtime.urlopen = _fake_urlopen
+    original_request = client_transport_runtime.pooled_http_request
+    client_transport_runtime.pooled_http_request = _fake_request
     try:
         client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
         NodeControlClient.call_service(
@@ -216,7 +200,7 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
             ),
         )
     finally:
-        client_transport_runtime.urlopen = original_urlopen
+        client_transport_runtime.pooled_http_request = original_request
 
     assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "structured_v1"
 

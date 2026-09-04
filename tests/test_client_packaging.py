@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import os
 import sys
 import tarfile
 from pathlib import Path
@@ -239,6 +240,40 @@ def test_dependency_packager_reuses_tar_cache_for_unchanged_module(tmp_path, mon
         assert second.read_bytes() == first_blob
     finally:
         second.unlink(missing_ok=True)
+
+
+def test_package_cache_prunes_oldest_entries(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.dependency import _prune_package_cache
+
+    cache_dir = tmp_path / "package-cache-prune"
+    cache_dir.mkdir()
+    for index in range(4):
+        path = cache_dir / f"{index}.tar.gz"
+        path.write_bytes(bytes([index]) * 8)
+        os.utime(path, (index + 1, index + 1))
+    monkeypatch.setenv("PYCLOUD_PACKAGE_CACHE_MAX_ENTRIES", "2")
+    monkeypatch.setenv("PYCLOUD_PACKAGE_CACHE_MAX_BYTES", "1024")
+
+    _prune_package_cache(cache_dir)
+
+    assert sorted(path.name for path in cache_dir.glob("*.tar.gz")) == ["2.tar.gz", "3.tar.gz"]
+
+
+def test_package_cache_read_race_falls_back_to_cache_miss(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import dependency as dependency_mod
+
+    cache_dir = tmp_path / "package-cache-race"
+    cache_dir.mkdir()
+    cache_key = "a" * 64
+    (cache_dir / f"{cache_key}.tar.gz").write_bytes(b"cached")
+    monkeypatch.setenv("PYCLOUD_PACKAGE_CACHE_DIR", str(cache_dir))
+    monkeypatch.setattr(
+        dependency_mod.shutil,
+        "copyfile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("pruned concurrently")),
+    )
+
+    assert dependency_mod._copy_cached_targz_if_available(cache_key, str(tmp_path / "out.tar.gz")) is False
 
 
 def test_dependency_packager_expands_project_relative_import_roots(tmp_path, monkeypatch):

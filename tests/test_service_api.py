@@ -877,6 +877,68 @@ def test_service_call_balanced_skips_initializing_replica():
     assert response["node"] == "ready"
 
 
+def test_service_default_proxy_and_worker_capacity_use_heartbeat_state_without_status_rpc():
+    calls = {"status": 0, "progress": 0}
+
+    def _unexpected_status():
+        calls["status"] += 1
+        raise AssertionError("default service call must not fetch status")
+
+    def _unexpected_progress():
+        calls["progress"] += 1
+        raise AssertionError("default service call must not fetch progress")
+
+    replica = SimpleNamespace(
+        kind="service",
+        service_id="svc-node-1",
+        readiness="ready",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        worker_count=2,
+        alive_workers=3,
+        in_flight=1,
+        get_status=_unexpected_status,
+        get_progress=_unexpected_progress,
+        call=lambda method, payload, **_kwargs: {"ok": True, "data": {"method": method, **payload}},
+    )
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-1": replica},
+        nodes={},
+    )
+    group._discovered_methods = ["run"]  # noqa: SLF001
+
+    assert group._effective_worker_count() == 3  # noqa: SLF001
+    assert group.run._refresh_status is False  # noqa: SLF001
+    node_id, response = group.call_balanced("run", {"value": 1})
+
+    assert node_id == "node-1"
+    assert response["data"]["value"] == 1
+    assert calls == {"status": 0, "progress": 0}
+
+
+def test_service_context_manager_stops_remote_replicas_immediately():
+    end_reasons = []
+    stopped = SimpleNamespace(
+        ok=True,
+        accepted=True,
+        status=pb2.SERVICE_STATUS_STOPPED,
+    )
+    replica = SimpleNamespace(end=lambda reason: end_reasons.append(reason) or stopped)
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-1": replica},
+        nodes={},
+    )
+
+    with group:
+        pass
+
+    assert end_reasons == ["service context exited"]
+    assert group._closed is True  # noqa: SLF001
+
+
 def test_service_call_balanced_all_initializing_has_clear_error():
     initializing = SimpleNamespace(
         readiness="initializing",
@@ -4833,7 +4895,7 @@ class TestOwnerServiceFacade:
 
         try:
             assert sorted(group.sessions) == ["node-a-inst", "node-b-inst"]
-            assert sorted(create_wait_ready) == [False, False]
+            assert sorted(create_wait_ready) == [True, True]
         finally:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()

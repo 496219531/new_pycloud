@@ -22,7 +22,8 @@ _SOURCE_UNSET = object()
 
 
 def _packaging_include_tests_default() -> bool:
-    return True
+    value = str(os.getenv("PYCLOUD_PACKAGE_INCLUDE_TESTS", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _packaging_kwargs(*, synthesize_missing_package_inits: Optional[bool] = None) -> dict[str, object]:

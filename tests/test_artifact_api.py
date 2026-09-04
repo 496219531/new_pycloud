@@ -86,6 +86,9 @@ def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None
                 status=pb2.SERVICE_STATUS_RUNNING,
             )
 
+        def heartbeat_service(self, **_kwargs):
+            return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
         def close(self) -> None:
             return None
 
@@ -241,6 +244,28 @@ def test_artifact_from_paths_packages_single_directory(tmp_path) -> None:
         names = set(tf.getnames())
     assert "demo_pkg/__init__.py" in names
     assert "demo_pkg/worker.py" in names
+
+
+def test_artifact_packaging_excludes_tests_by_default_and_allows_opt_in(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane.artifact import Artifact, _prepare_artifact
+
+    pkg_dir = tmp_path / "demo_pkg_with_tests"
+    tests_dir = pkg_dir / "tests"
+    tests_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_dir / "worker.py").write_text("def run(): return 1\n", encoding="utf-8")
+    (tests_dir / "test_worker.py").write_text("def test_run(): assert True\n", encoding="utf-8")
+    artifact = Artifact.from_paths(pkg_dir, entry_module="demo_pkg_with_tests.worker")
+
+    monkeypatch.delenv("PYCLOUD_PACKAGE_INCLUDE_TESTS", raising=False)
+    prepared = _prepare_artifact(artifact, consumer_kind="service")
+    with tarfile.open(fileobj=io.BytesIO(prepared.blob), mode="r:gz") as tf:
+        assert "demo_pkg_with_tests/tests/test_worker.py" not in set(tf.getnames())
+
+    monkeypatch.setenv("PYCLOUD_PACKAGE_INCLUDE_TESTS", "true")
+    prepared_with_tests = _prepare_artifact(artifact, consumer_kind="service")
+    with tarfile.open(fileobj=io.BytesIO(prepared_with_tests.blob), mode="r:gz") as tf:
+        assert "demo_pkg_with_tests/tests/test_worker.py" in set(tf.getnames())
 
 
 def test_artifact_from_paths_project_root_keeps_entry_root_importable(tmp_path) -> None:

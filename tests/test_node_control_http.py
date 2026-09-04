@@ -40,6 +40,47 @@ def _start_http_node_with_api_token(tmp_path, token: str):
     return server, state
 
 
+def test_submit_pool_tasks_forwards_optional_timeout(monkeypatch):
+    client = HttpNodeControlClient("http://127.0.0.1:1", timeout_sec=17.0)
+    captured = []
+
+    def _json(method, path, payload, *, timeout_sec=None, headers=None):
+        captured.append(("json", timeout_sec))
+        return {"ok": True}
+
+    def _binary_json(method, path, meta, chunks, *, timeout_sec=None):
+        captured.append(("binary", timeout_sec))
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_json", _json)
+    monkeypatch.setattr(client, "_binary_json", _binary_json)
+
+    client.submit_pool_tasks(
+        pool_id="pool-1",
+        pool_token="token",
+        tasks=[pb2.TaskSubmitItem(task_id="json-task")],
+        timeout_sec=2.5,
+    )
+    client.submit_pool_tasks(
+        pool_id="pool-1",
+        pool_token="token",
+        tasks=[
+            pb2.TaskSubmitItem(
+                task_id="binary-task",
+                transport_payload=pb2.TransportPayload(codec="pickle", version=1, payload=b"payload"),
+            )
+        ],
+        timeout_sec=3.5,
+    )
+    client.submit_pool_tasks(
+        pool_id="pool-1",
+        pool_token="token",
+        tasks=[pb2.TaskSubmitItem(task_id="default-task")],
+    )
+
+    assert captured == [("json", 2.5), ("binary", 3.5), ("json", None)]
+
+
 def test_http_create_service_call_heartbeat_status_close(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"

@@ -298,6 +298,7 @@ class DiscoveryServiceClient:
         failed_count = 0
         last_failed_route_id = ""
         last_error: Optional[Exception] = None
+        forced_refresh_done = False
 
         def _prepare_payload_for_route(selected_route: object) -> Dict[str, object]:
             control_addr = str(getattr(selected_route, "control_addr", "") or "").strip()
@@ -335,24 +336,26 @@ class DiscoveryServiceClient:
                 )
 
         def _has_untried_cached_route() -> bool:
+            nonlocal forced_refresh_done
             try:
                 rows = self._route_cache.refresh_for_method(name, method=method_name)
-                cached = [
+                available = [
                     item
                     for item in rows
                     if str(getattr(item, "service_id", "") or "") not in tried
                 ]
-                if cached:
+                if available:
                     return True
-                return bool(
-                    [
-                        item
-                        for item in self._route_cache.refresh_for_method(name, method=method_name)
-                        if str(getattr(item, "service_id", "") or "") not in tried
-                    ]
+                if forced_refresh_done:
+                    return False
+                forced_refresh_done = True
+                refreshed = self._route_cache.refresh_for_method(name, method=method_name, force=True)
+                return any(
+                    str(getattr(item, "service_id", "") or "") not in tried
+                    for item in refreshed
                 )
             except Exception:
-                return True
+                return False
 
         while True:
             try:
@@ -402,8 +405,6 @@ class DiscoveryServiceClient:
                 failed_count += 1
                 last_failed_route_id = route_id
                 self._route_cache.mark_failure(route, str(exc))
-                with contextlib.suppress(Exception):
-                    self._route_cache.refresh_for_method(name, method=method_name)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -414,8 +415,6 @@ class DiscoveryServiceClient:
                 failed_count += 1
                 last_failed_route_id = route_id
                 self._route_cache.mark_failure(route, str(exc))
-                with contextlib.suppress(Exception):
-                    self._route_cache.refresh_for_method(name, method=method_name)
                 continue
 
     def _list_methods_via_route(self, route: object, *, include_docs: bool) -> List[Dict[str, object]]:

@@ -271,7 +271,6 @@ def test_public_deploy_open_reject_legacy_artifact_keywords():
         "artifact_path": "legacy.py",
         "dependency_allowlist": ["orjson==3.10.18"],
         "export_mode": "single",
-        "export_methods": ["run"],
         "func": lambda: None,
     }
 
@@ -280,6 +279,9 @@ def test_public_deploy_open_reject_legacy_artifact_keywords():
             ApiService.deploy(target="127.0.0.1:50051", source=b"svc", **{name: value})
         with pytest.raises(TypeError):
             ApiTaskPool.open(target="127.0.0.1:50051", source=b"pool", **{name: value})
+
+    with pytest.raises(TypeError):
+        ApiTaskPool.open(target="127.0.0.1:50051", source=b"pool", export_methods=["run"])
 
 
 def test_service_startup_rejects_legacy_dependency_allowlist():

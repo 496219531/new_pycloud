@@ -104,6 +104,7 @@ def test_taskpool_after_keepalive_tick_uses_recovery_intervals() -> None:
         session._after_keepalive_tick()  # noqa: SLF001
         assert len(submitted) == 1
 
+        session._pools["node-1"] = SimpleNamespace(failed=False)  # noqa: SLF001
         session._active_replica_ids = {"node-1"}  # noqa: SLF001
         session._last_compensation_attempt_at = 196.0  # noqa: SLF001
         time.monotonic = lambda: 200.0  # type: ignore[assignment]
@@ -118,6 +119,7 @@ def test_taskpool_after_keepalive_tick_uses_recovery_intervals() -> None:
         session._after_keepalive_tick()  # noqa: SLF001
         assert len(submitted) == 2
 
+        session._pools["node-2"] = SimpleNamespace(failed=False)  # noqa: SLF001
         session._active_replica_ids = {"node-1", "node-2"}  # noqa: SLF001
         session._last_compensation_attempt_at = 0.0  # noqa: SLF001
         time.monotonic = lambda: 300.0  # type: ignore[assignment]
@@ -126,6 +128,18 @@ def test_taskpool_after_keepalive_tick_uses_recovery_intervals() -> None:
     finally:
         time.monotonic = original_monotonic  # type: ignore[assignment]
         session._stop_keepalive()  # noqa: SLF001
+
+
+def test_taskpool_effective_worker_count_uses_local_heartbeat_snapshot() -> None:
+    pool = SimpleNamespace(
+        worker_count=3,
+        alive_workers=2,
+        failed=False,
+        get_status=lambda: (_ for _ in ()).throw(AssertionError("worker count must not perform status RPC")),
+    )
+    session = TaskPool(pools={"node-1": pool}, nodes={}, task_method="run")
+
+    assert session._effective_worker_count() == 3  # noqa: SLF001
 
 
 def test_taskpool_zero_alive_does_not_drive_owner_compensation() -> None:

@@ -142,7 +142,7 @@ _CHOICE_SETTINGS: dict[str, EnvChoiceSetting] = {
     "EXECUTOR_BACKEND": EnvChoiceSetting(PYCLOUD_EXECUTOR_BACKEND, "subprocess_host", frozenset({"subprocess_host"})),
     "DATAREF_RESOLUTION": EnvChoiceSetting(PYCLOUD_DATAREF_RESOLUTION, "remote_fetch", frozenset({"local_only", "remote_fetch"})),
     "DATAREF_UPLOAD_STRATEGY": EnvChoiceSetting(PYCLOUD_DATAREF_UPLOAD_STRATEGY, "upload_once", frozenset({"fanout", "upload_once"})),
-    "GATEWAY_DATAREF_RELAY": EnvChoiceSetting(PYCLOUD_GATEWAY_DATAREF_RELAY, "eager", frozenset({"eager", "lazy"})),
+    "GATEWAY_DATAREF_RELAY": EnvChoiceSetting(PYCLOUD_GATEWAY_DATAREF_RELAY, "lazy", frozenset({"eager", "lazy"})),
     "JOBQUEUE_RESOLVE_REFS": EnvChoiceSetting(PYCLOUD_JOBQUEUE_RESOLVE_REFS, "defer_to_worker", frozenset({"eager", "defer_to_worker"})),
 }
 
@@ -653,7 +653,7 @@ def get_dataref_upload_strategy() -> DataRefUploadStrategy:
 
 
 def get_gateway_dataref_relay() -> GatewayDataRefRelayMode:
-    return str(GATEWAY_DATAREF_RELAY or "eager").strip().lower()  # type: ignore[return-value]
+    return str(GATEWAY_DATAREF_RELAY or "lazy").strip().lower()  # type: ignore[return-value]
 
 
 def get_jobqueue_resolve_refs() -> JobQueueResolveRefsMode:

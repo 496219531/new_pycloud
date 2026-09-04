@@ -14,13 +14,18 @@ import tempfile
 import threading
 import time
 from datetime import timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qsl, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from google.protobuf import json_format
+
+from pycloud_parallel.controlplane.bounded_http_server import (
+    BoundedThreadPoolHTTPServer,
+    DEFAULT_HTTP_QUEUE_CAPACITY,
+)
 
 from pycloud_parallel.controlplane.artifact import (
     ArtifactDeps,
@@ -1133,6 +1138,8 @@ class NodeControlHttpServer:
         on_service_routes_changed=None,
         max_body_bytes: int = MAX_NODE_CONTROL_HTTP_BODY_BYTES,
         api_token: str = "",
+        max_workers: int = 32,
+        queue_capacity: int = DEFAULT_HTTP_QUEUE_CAPACITY,
     ) -> None:
         self.bind = bind
         self.app = NodeControlHttpApp(
@@ -1141,7 +1148,9 @@ class NodeControlHttpServer:
             max_body_bytes=max_body_bytes,
             api_token=api_token,
         )
-        self._server: Optional[ThreadingHTTPServer] = None
+        self.max_workers = int(max_workers)
+        self.queue_capacity = int(queue_capacity)
+        self._server: Optional[BoundedThreadPoolHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
 
@@ -1150,6 +1159,8 @@ class NodeControlHttpServer:
         app = self.app
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):  # noqa: N802
                 try:
                     result = app.handle_get(self.path)
@@ -1212,6 +1223,8 @@ class NodeControlHttpServer:
             def _send(self, status_code: int, headers: Dict[str, str], raw: bytes) -> None:
                 self.send_response(int(status_code))
                 for key, value in dict(headers or {}).items():
+                    if str(key).lower() == "content-length":
+                        continue
                     self.send_header(str(key), str(value))
                 self.send_header("Content-Length", str(len(raw or b"")))
                 self.end_headers()
@@ -1235,10 +1248,12 @@ class NodeControlHttpServer:
                         raise
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
+                self.close_connection = True
                 self.send_response(int(response.status_code or 200))
                 self.send_header("Content-Type", str(response.content_type or "application/octet-stream"))
+                self.send_header("Connection", "close")
                 for key, value in dict(response.extra_headers or {}).items():
-                    if str(key).lower() == "content-type":
+                    if str(key).lower() in {"connection", "content-length", "content-type"}:
                         continue
                     self.send_header(str(key), str(value))
                 if int(response.content_length or 0) > 0:
@@ -1268,7 +1283,13 @@ class NodeControlHttpServer:
             def log_message(self, _format, *args):  # noqa: A002
                 return
 
-        self._server = ThreadingHTTPServer((host, int(port)), _Handler)
+        self._server = BoundedThreadPoolHTTPServer(
+            (host, int(port)),
+            _Handler,
+            max_workers=self.max_workers,
+            queue_capacity=self.queue_capacity,
+            thread_name_prefix="nodecontrol-http-worker",
+        )
         actual_port = self._server.server_address[1]
         public_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
         self.base_url = f"http://{public_host}:{actual_port}"
@@ -1604,6 +1625,7 @@ class HttpNodeControlClient:
             payload,
             headers=self._api_headers(api_token),
             timeout_sec=timeout_sec,
+            retry_connection_error=bool(str(create_request_id or "").strip()),
         )
         now = utc_now()
         return NativeTaskPoolClient(
@@ -1713,6 +1735,7 @@ class HttpNodeControlClient:
             payload,
             headers=self._api_headers(api_token),
             timeout_sec=timeout_sec,
+            retry_connection_error=bool(str(create_request_id or "").strip()),
         )
         now = utc_now()
         return ServiceSessionClient(
@@ -1739,7 +1762,15 @@ class HttpNodeControlClient:
             lease_expire_at=now + timedelta(seconds=max(1, int(data.get("heartbeat_timeout_sec", 0) or 0))),
         )
 
-    def submit_pool_tasks(self, *, pool_id: str, pool_token: str, tasks: Sequence[pb2.TaskSubmitItem], job_id: str = "") -> pb2.SubmitTasksResponse:
+    def submit_pool_tasks(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        job_id: str = "",
+        timeout_sec: Optional[float] = None,
+    ) -> pb2.SubmitTasksResponse:
         if any(item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip() for item in tasks):
             meta_tasks = []
             chunks = []
@@ -1762,12 +1793,14 @@ class HttpNodeControlClient:
                 f"/taskpools/{quote(str(pool_id), safe='')}/submit-bytes",
                 {"pool_token": pool_token, "tasks": meta_tasks, "job_id": job_id},
                 chunks,
+                timeout_sec=timeout_sec,
             )
             return _parse_message(pb2.SubmitTasksResponse, data)
         data = self._json(
             "POST",
             f"/taskpools/{quote(str(pool_id), safe='')}/submit",
             {"pool_token": pool_token, "tasks": [_message_to_dict(item) for item in tasks], "job_id": job_id},
+            timeout_sec=timeout_sec,
         )
         return _parse_message(pb2.SubmitTasksResponse, data)
 
@@ -2122,6 +2155,7 @@ class HttpNodeControlClient:
         *,
         timeout_sec: Optional[float] = None,
         headers: Optional[Dict[str, str]] = None,
+        retry_connection_error: Optional[bool] = None,
     ) -> Dict[str, object]:
         return runtime_http_request(
             base_url=self.base_url,
@@ -2133,6 +2167,7 @@ class HttpNodeControlClient:
                 timeout_sec=float(timeout_sec if timeout_sec is not None else self.timeout_sec),
                 method=method.upper(),
                 headers=dict(headers or {}),
+                retry_connection_error=retry_connection_error,
             ),
         )
 

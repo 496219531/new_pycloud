@@ -46,6 +46,7 @@ def _register_node(info_target: str, *, node_id: str, control_addr: str, state: 
     with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
         infocenter.register_node(
             node_id=node_id,
+            node_instance_id=state.node_instance_id,
             control_addr=control_addr,
             capacity=8,
             queue_capacity=64,
@@ -87,8 +88,8 @@ def test_native_task_pool_end_to_end(tmp_path):
             tags=["compute"],
         ) as pool:
             status_map = pool.status_map()
-            assert "node-pool-01" in status_map
-            assert status_map["node-pool-01"].status == "RUNNING"
+            assert node_state.node_instance_id in status_map
+            assert status_map[node_state.node_instance_id].status == "RUNNING"
 
             submit = pool.submit_payloads([{"value": 2}, {"value": 3}, {"value": 4}])
             assert len(submit.accepted) == 3

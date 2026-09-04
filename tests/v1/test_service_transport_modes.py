@@ -16,25 +16,11 @@ from pycloud_parallel.controlplane.client_transport import (
     _is_http_transport_content_type,
 )
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
+from pycloud_parallel.controlplane.http_connection_pool import BufferedHttpResponse
 from pycloud_parallel.controlplane.payload_transport import encode_result_for_transport
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
-
-
-class _FakeHttpResponse:
-    def __init__(self, body: bytes, *, headers: dict[str, str] | None = None) -> None:
-        self._body = body
-        self.headers = dict(headers or {})
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> "_FakeHttpResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
 
 
 def _assert_payload_roundtrip(actual: object, expected: object) -> None:
@@ -83,17 +69,19 @@ def test_call_route_http_roundtrips_transport_modes(monkeypatch):
         payload = _demo_payload(mode)
         result = _demo_result(mode)
 
-        def _fake_urlopen(request, timeout=0.0):  # noqa: ARG001
-            content_type = request.headers.get("Content-Type", "") or request.headers.get("Content-type", "")
+        def _fake_request(**kwargs):
+            headers = dict(kwargs.get("headers") or {})
+            request_body = kwargs.get("body") or b""
+            content_type = headers.get("Content-Type", "") or headers.get("Content-type", "")
             if _is_http_transport_content_type(content_type):
                 decoded_payload, request_mode = _decode_http_transport_request_body_with_mode(
-                    request.data or b"",
-                    headers=request.headers,
+                    request_body,
+                    headers=headers,
                     context="service_internal",
                 )
             else:
                 decoded_payload, request_mode = _decode_http_request_body_with_mode(
-                    request.data or b"{}",
+                    request_body or b"{}",
                     context="service call payload",
                 )
             assert request_mode == mode
@@ -107,7 +95,7 @@ def test_call_route_http_roundtrips_transport_modes(monkeypatch):
                     context="service_result",
                     mode=request_mode,
                 )
-                return _FakeHttpResponse(raw, headers=response_headers)
+                return BufferedHttpResponse(200, "OK", response_headers, raw)
             body = {
                 "ok": True,
                 "data": encode_result_for_transport(
@@ -117,9 +105,9 @@ def test_call_route_http_roundtrips_transport_modes(monkeypatch):
                 ),
             }
             raw = json.dumps(serialize_arrow_compatible(body), ensure_ascii=False).encode("utf-8")
-            return _FakeHttpResponse(raw, headers={"Content-Type": "application/json; charset=utf-8"})
+            return BufferedHttpResponse(200, "OK", {"Content-Type": "application/json; charset=utf-8"}, raw)
 
-        monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.urlopen", _fake_urlopen)
+        monkeypatch.setattr("pycloud_parallel.controlplane.client_transport.pooled_http_request", _fake_request)
         response = _call_route_http(
             route,
             method="run",

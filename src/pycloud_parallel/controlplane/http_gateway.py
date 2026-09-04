@@ -7,7 +7,7 @@ import json
 import threading
 import traceback
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
@@ -19,6 +19,7 @@ from .client_transport import (
     _is_http_transport_content_type,
 )
 from pycloud_parallel.controlplane.config import get_service_http_body_limit_bytes
+from pycloud_parallel.controlplane.bounded_http_server import BoundedThreadPoolHTTPServer
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
@@ -50,13 +51,8 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
 
 
 MAX_BODY_BYTES = get_service_http_body_limit_bytes()
-SERVICE_HTTP_REQUEST_QUEUE_SIZE = 1024
-
-
-class _ServiceThreadingHTTPServer(ThreadingHTTPServer):
-    # The stdlib default backlog is 5, which is too small for bursty async
-    # service calls that fan out many HTTP connections to a single route.
-    request_queue_size = SERVICE_HTTP_REQUEST_QUEUE_SIZE
+SERVICE_HTTP_MAX_WORKERS = 128
+SERVICE_HTTP_QUEUE_CAPACITY = 1024
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -75,13 +71,17 @@ class ServiceHttpGateway:
         status_handler: StatusHandler,
         methods_handler: Optional[MethodsHandler] = None,
         extra_get_handler: Optional[ExtraGetHandler] = None,
+        max_workers: int = SERVICE_HTTP_MAX_WORKERS,
+        queue_capacity: int = SERVICE_HTTP_QUEUE_CAPACITY,
     ) -> None:
         self._bind = bind
         self._invoke_handler = invoke_handler
         self._status_handler = status_handler
         self._methods_handler = methods_handler
         self._extra_get_handler = extra_get_handler
-        self._server: Optional[ThreadingHTTPServer] = None
+        self.max_workers = int(max_workers)
+        self.queue_capacity = int(queue_capacity)
+        self._server: Optional[BoundedThreadPoolHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
         self.base_url = ""
@@ -98,6 +98,8 @@ class ServiceHttpGateway:
         extra_get_handler = self._extra_get_handler
 
         class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_POST(self):  # noqa: N802
                 try:
                     parsed = urlparse(self.path)
@@ -285,6 +287,8 @@ class ServiceHttpGateway:
                     self.send_response(status_code)
                     self.send_header("Content-Type", str(content_type or "application/octet-stream"))
                     for key, value in dict(extra_headers or {}).items():
+                        if str(key).lower() in {"content-length", "content-type"}:
+                            continue
                         self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
@@ -295,11 +299,14 @@ class ServiceHttpGateway:
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
                 try:
+                    self.close_connection = True
                     self.send_response(int(response.status_code or 200))
                     self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     for key, value in dict(response.extra_headers or {}).items():
+                        if str(key).lower() in {"connection", "content-length", "content-type"}:
+                            continue
                         self.send_header(str(key), str(value))
                     if int(response.content_length or 0) > 0:
                         self.send_header("Content-Length", str(int(response.content_length)))
@@ -317,7 +324,13 @@ class ServiceHttpGateway:
         with self._start_lock:
             if self._server is not None:
                 return
-            self._server = _ServiceThreadingHTTPServer((host, port), _Handler)
+            self._server = BoundedThreadPoolHTTPServer(
+                (host, port),
+                _Handler,
+                max_workers=self.max_workers,
+                queue_capacity=self.queue_capacity,
+                thread_name_prefix="service-http-worker",
+            )
             self._thread = threading.Thread(target=self._server.serve_forever, name="service-http-gateway", daemon=True)
             self._thread.start()
 

@@ -60,7 +60,7 @@ def test_relay_payload_data_refs_v1_rewrites_nested_refs():
     assert mocked.call_count == 2
 
 
-def test_relay_data_ref_v1_defaults_to_eager_copy(monkeypatch, request):
+def test_relay_data_ref_v1_defaults_to_lazy_locator(monkeypatch, request):
     from pycloud_parallel.controlplane import config as config_mod
 
     monkeypatch.delenv("PYCLOUD_GATEWAY_DATAREF_RELAY", raising=False)
@@ -110,12 +110,9 @@ def test_relay_data_ref_v1_defaults_to_eager_copy(monkeypatch, request):
 
     relayed = relay_data_ref_v1(route=route, data_ref=original, registry_target="127.0.0.1:50051", timeout_sec=5.0)
 
-    assert relayed.control_addr == "127.0.0.1:50062"
-    assert relayed.storage_id == "sha256:" + "c" * 64
-    assert calls == [
-        ("download", "127.0.0.1:50061", original.object_id),
-        ("upload", "127.0.0.1:50062", b"hello", "bin"),
-    ]
+    assert relayed.control_addr == "127.0.0.1:50061"
+    assert relayed.storage_id == original.storage_id
+    assert calls == []
 
 
 def test_relay_data_ref_v1_lazy_keeps_source_locator_without_copy(monkeypatch, request):

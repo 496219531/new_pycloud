@@ -91,6 +91,90 @@ def _cleanup_object_upload_source(source) -> None:
         Path(source.file_path).unlink(missing_ok=True)
 
 
+def test_light_registrar_snapshot_only_scans_active_task_index(tmp_path):
+    state = NodeControlState(
+        node_id="node-light-registrar-index",
+        artifact_dir=str(tmp_path / "code_cache_light_registrar_index"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+
+    class _HistoricalTask:
+        @property
+        def status(self):
+            raise AssertionError("light registrar snapshot scanned historical task state")
+
+    active = TaskState(
+        task_id="active-1",
+        client_id="pool-1",
+        job_id="job-1",
+        code_version="sha256:active",
+        runtime_key="runtime-active",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_RUNNING,
+        started_at=now,
+        last_heartbeat_at=now,
+    )
+    try:
+        with state._lock:  # noqa: SLF001
+            state._pool_tasks = {  # noqa: SLF001
+                **{f"done-{index}": _HistoricalTask() for index in range(1000)},
+                active.task_id: active,
+            }
+            state._active_pool_task_ids = {active.task_id}  # noqa: SLF001
+        snapshot = state.registrar_snapshot(include_inventory=False)
+        assert snapshot["metrics"]["inflight"] == 1
+        assert snapshot["metrics"]["queued"] == 0
+    finally:
+        state.close()
+
+
+def test_light_registrar_snapshot_prunes_inactive_resource_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_NODE_INACTIVE_RESOURCE_HISTORY_LIMIT", "2")
+    state = NodeControlState(
+        node_id="node-resource-history",
+        artifact_dir=str(tmp_path / "code_cache_resource_history"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _StoppedService:
+        status = pb2.SERVICE_STATUS_STOPPED
+
+        @staticmethod
+        def is_running():
+            return False
+
+    class _StoppedPool:
+        status = "STOPPED"
+
+        def __init__(self, pool_id):
+            self.pool_id = pool_id
+
+        @staticmethod
+        def is_running():
+            return False
+
+    try:
+        with state._lock:  # noqa: SLF001
+            state._services = {f"svc-{index}": _StoppedService() for index in range(5)}  # noqa: SLF001
+            state._task_pools = {  # noqa: SLF001
+                f"pool-{index}": _StoppedPool(f"pool-{index}")
+                for index in range(5)
+            }
+        state._pool_result_hook.push("pool-0", pb2.TaskResult(task_id="old-result"))  # noqa: SLF001
+        state.registrar_snapshot(include_inventory=False)
+        assert list(state._services) == ["svc-3", "svc-4"]  # noqa: SLF001
+        assert list(state._task_pools) == ["pool-3", "pool-4"]  # noqa: SLF001
+        assert "pool-0" not in state._pool_result_hook._queues  # noqa: SLF001
+    finally:
+        state.close()
+
+
 def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
     source.write_bytes(b"hello")
@@ -5271,6 +5355,7 @@ def test_pull_pool_results_prunes_completed_task_state(tmp_path):
         )
         assert len(accepted) == 1
         assert not rejected
+        assert "pool-prune-1" in state._active_pool_task_ids  # noqa: SLF001
 
         deadline = time.time() + 10.0
         results = []
@@ -5290,6 +5375,7 @@ def test_pull_pool_results_prunes_completed_task_state(tmp_path):
         assert len(results) == 1
         assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
         assert "pool-prune-1" not in state._pool_tasks  # noqa: SLF001
+        assert "pool-prune-1" not in state._active_pool_task_ids  # noqa: SLF001
     finally:
         state.close()
 

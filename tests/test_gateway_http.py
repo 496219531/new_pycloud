@@ -865,8 +865,8 @@ def test_gateway_upload_call_reuses_stage_file_on_route_retry(tmp_path):
         def stop(self) -> None:
             return None
 
-        def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
-            del service_name, force_refresh
+        def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False, method: str = ""):
+            del service_name, force_refresh, method
             excluded = set(exclude_service_ids or ())
             if "svc-retry-1" not in excluded:
                 return self.route_1

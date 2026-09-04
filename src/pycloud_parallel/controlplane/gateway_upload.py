@@ -6,8 +6,10 @@ import contextlib
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, BinaryIO, Dict, Optional, Sequence, Tuple
 import uuid
 
@@ -520,10 +522,27 @@ def relay_data_ref_v1(
         return relayed
     if not route_control_addr:
         raise GatewayUploadError("route control_addr is required for DataRef relay")
-    with NodeControlClient(source_addr, timeout_sec=max(0.1, float(timeout_sec))) as source_client:
-        blob = source_client.download_object_bytes(object_id=normalized_ref.object_id)
-    with NodeControlClient(route_control_addr, timeout_sec=max(0.1, float(timeout_sec))) as target_client:
-        uploaded = target_client.upload_object_from_bytes(blob=blob, format=normalized_ref.format)
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-gateway-relay-", suffix=".object")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with NodeControlClient(source_addr, timeout_sec=max(0.1, float(timeout_sec))) as source_client:
+            download_to_file = getattr(source_client, "download_object_to_file", None)
+            if callable(download_to_file):
+                download_to_file(object_id=normalized_ref.object_id, target_path=str(tmp_path))
+            else:
+                tmp_path.write_bytes(source_client.download_object_bytes(object_id=normalized_ref.object_id))
+        with NodeControlClient(route_control_addr, timeout_sec=max(0.1, float(timeout_sec))) as target_client:
+            upload_from_file = getattr(target_client, "upload_object_from_file", None)
+            if callable(upload_from_file):
+                uploaded = upload_from_file(file_path=str(tmp_path), format=normalized_ref.format)
+            else:
+                uploaded = target_client.upload_object_from_bytes(
+                    blob=tmp_path.read_bytes(),
+                    format=normalized_ref.format,
+                )
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return DataRef(
         ref_id=str(uploaded.ref_id or uploaded.object_id),
         storage_id=str(uploaded.storage_id or uploaded.object_id),

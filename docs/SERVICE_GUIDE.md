@@ -114,6 +114,7 @@ finally:
 ```
 
 `Service.close()` 默认只关闭当前 owner/client handle，不会停止已经部署到 node 上的 service replicas。
+`with Service.deploy(...) as group:` 属于托管生命周期：退出 `with` 时会调用 `close(end_services=True)`，立即停止远端 replicas。需要让远端服务继续存活时，不要使用 `with`，并显式调用 `close_handle()`。
 如果语义上只是释放本地 handle，可以写得更明确：
 
 ```python

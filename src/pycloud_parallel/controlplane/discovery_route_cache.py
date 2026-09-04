@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route, _route_sort_key
 from pycloud_parallel.controlplane.scheduling_policy import is_call_route
+from pycloud_parallel.execution.dependency_failover import dependency_method_blocked
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
     ROUTE_UNAVAILABLE,
@@ -60,6 +61,7 @@ class _DiscoveryRouteCache:
         self._local_inflight: Dict[Tuple[str, str], int] = {}
         self._last_call_observation: Dict[str, Dict[str, object]] = {}
         self._route_index: Dict[str, int] = {}
+        self._refreshing: Dict[str, threading.Event] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -89,7 +91,7 @@ class _DiscoveryRouteCache:
                 service_names = list(self._snapshots.keys())
             for service_name in service_names:
                 try:
-                    self.refresh(service_name, force=True)
+                    self.refresh(service_name, force=False)
                 except Exception:
                     continue
 
@@ -97,57 +99,84 @@ class _DiscoveryRouteCache:
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
-        with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
-            rows = list(
-                client.list_service_routes(
-                    service_name=name,
-                    healthy_only=True,
-                    limit=self.route_limit,
-                )
-            )
-        snapshot = _ServiceRouteSnapshot(
-            service_name=name,
-            routes=rows,
-            refreshed_at=datetime.now(timezone.utc),
-        )
         with self._lock:
-            if force or name not in self._snapshots or rows:
-                self._snapshots[name] = snapshot
-            valid_ids = {str(getattr(route, "service_id", "") or "") for route in rows}
-            for key in list(self._local_state.keys()):
-                svc_name, svc_id = key
-                if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
-                    self._local_state.pop(key, None)
-            for key in list(self._local_inflight.keys()):
-                svc_name, svc_id = key
-                if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
-                    self._local_inflight.pop(key, None)
-        return rows
+            snapshot = self._snapshots.get(name)
+            previous_refreshed_at = snapshot.refreshed_at if snapshot is not None else None
+            if not force and self._snapshot_fresh(snapshot):
+                return list(snapshot.routes)
+            refresh_event = self._refreshing.get(name)
+            if refresh_event is None:
+                refresh_event = threading.Event()
+                self._refreshing[name] = refresh_event
+                refresh_owner = True
+            else:
+                refresh_owner = False
 
-    def refresh_for_method(self, service_name: str, *, method: str) -> Sequence[object]:
+        if not refresh_owner:
+            if not refresh_event.wait(timeout=self.timeout_sec + 0.5):
+                raise TimeoutError(f"route refresh timed out for service_name={name}")
+            with self._lock:
+                snapshot = self._snapshots.get(name)
+                if snapshot is not None and snapshot.refreshed_at != previous_refreshed_at:
+                    return list(snapshot.routes)
+            raise RuntimeError(f"route refresh failed to update snapshot for service_name={name}")
+
+        try:
+            with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
+                rows = list(
+                    client.list_service_routes(
+                        service_name=name,
+                        healthy_only=True,
+                        limit=self.route_limit,
+                    )
+                )
+            snapshot = _ServiceRouteSnapshot(
+                service_name=name,
+                routes=rows,
+                refreshed_at=datetime.now(timezone.utc),
+            )
+            with self._lock:
+                self._snapshots[name] = snapshot
+                valid_ids = {str(getattr(route, "service_id", "") or "") for route in rows}
+                for key in list(self._local_state.keys()):
+                    svc_name, svc_id = key
+                    if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
+                        self._local_state.pop(key, None)
+                for key in list(self._local_inflight.keys()):
+                    svc_name, svc_id = key
+                    if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
+                        self._local_inflight.pop(key, None)
+            return rows
+        finally:
+            with self._lock:
+                self._refreshing.pop(name, None)
+                refresh_event.set()
+
+    def _snapshot_fresh(self, snapshot: Optional[_ServiceRouteSnapshot]) -> bool:
+        if snapshot is None:
+            return False
+        age_sec = max(0.0, (datetime.now(timezone.utc) - snapshot.refreshed_at).total_seconds())
+        return age_sec < self.refresh_interval_sec
+
+    def refresh_for_method(self, service_name: str, *, method: str, force: bool = False) -> Sequence[object]:
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
         normalized_method = str(method or "").strip()
-        with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
-            return list(
-                client.list_service_routes(
-                    service_name=name,
-                    healthy_only=True,
-                    limit=self.route_limit,
-                    method=normalized_method,
-                )
-            )
+        routes = self.refresh(name, force=force)
+        if not normalized_method:
+            return list(routes)
+        return [
+            route
+            for route in routes
+            if not dependency_method_blocked(getattr(route, "method_failures", {}), method=normalized_method)
+        ]
 
     def get_routes(self, service_name: str) -> Sequence[object]:
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
-        with self._lock:
-            snapshot = self._snapshots.get(name)
-        if snapshot is None:
-            return list(self.refresh(name, force=True))
-        return list(snapshot.routes)
+        return list(self.refresh(name, force=False))
 
     def snapshot_info(self, service_name: str) -> Dict[str, object]:
         name = str(service_name or "").strip()
@@ -201,9 +230,9 @@ class _DiscoveryRouteCache:
         name = str(service_name or "").strip()
         normalized_method = str(method or "").strip()
         if normalized_method:
-            routes = list(self.refresh_for_method(name, method=normalized_method))
+            routes = list(self.refresh_for_method(name, method=normalized_method, force=force_refresh))
         else:
-            routes = list(self.refresh(name, force=True)) if force_refresh else list(self.get_routes(name))
+            routes = list(self.refresh(name, force=force_refresh))
         excluded = exclude_service_ids or set()
         candidates = [
             route
