@@ -3984,7 +3984,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         freed_total = max(0, sum(int(value or 0) for value in freed_by_node.values()))
                         if freed_total > 0:
                             max_pending = adaptive_controller.window if adaptive_controller is not None else max_pending
-                            refill_quota = {node_id: freed_total for node_id in node_ids}
+                            refill_capacity = max(0, max_pending - sum(inflight_by_node.values()))
+                            refill_quota = {node_id: refill_capacity for node_id in node_ids}
                             self._fill_imap_from_quota(
                                 refill_quota,
                                 node_order=node_ids,

@@ -6047,11 +6047,27 @@ class NodeControlState(NodeRuntimeBase):
             )
 
     def _dispatch_loop(self) -> None:
+        consecutive_failures = 0
+        last_failure_log_at = 0.0
         while not self._stop_event.is_set():
-            self._drain_executor_events()
-            rebuilt = self._ensure_executor_host_alive()
-            if rebuilt:
+            try:
                 self._drain_executor_events()
+                rebuilt = self._ensure_executor_host_alive()
+                if rebuilt:
+                    self._drain_executor_events()
+                consecutive_failures = 0
+            except Exception:
+                consecutive_failures += 1
+                now = time.monotonic()
+                if consecutive_failures == 1 or now - last_failure_log_at >= 5.0:
+                    last_failure_log_at = now
+                    logger.exception(
+                        "nodecontrol dispatcher iteration failed node_id=%s node_instance_id=%s "
+                        "consecutive_failures=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                        consecutive_failures,
+                    )
             self._stop_event.wait(self.executor_poll_interval_sec)
 
     def _monitor_loop(self) -> None:
