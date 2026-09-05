@@ -8,6 +8,8 @@ import subprocess
 import traceback
 import multiprocessing as mp
 import os
+import pickle
+import queue
 import signal
 import sys
 import threading
@@ -26,7 +28,8 @@ def _simple_queue_get_if_ready(simple_queue, *, timeout: float = 0.0):
         try:
             if not reader.poll(max(0.0, float(timeout))):
                 return None
-            return simple_queue.get()
+            value = simple_queue.get()
+            return pickle.loads(value) if isinstance(value, bytes) else value
         except (EOFError, OSError):
             return None
     try:
@@ -118,10 +121,13 @@ def _windows_spawn_entrypoint_hint() -> str:
 class ExecutorHostClient:
     def __init__(self, *, task_worker_capacity: int = 1) -> None:
         self._ctx = mp.get_context("spawn")
-        self._request_q = self._ctx.SimpleQueue()
+        self._request_q = self._ctx.Queue(maxsize=128)
+        self._request_q.cancel_join_thread()
         self._event_q = self._ctx.SimpleQueue()
         self._responses: Dict[str, Dict[str, Any]] = {}
         self._stream_events: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._stream_buffer_bytes: Dict[str, int] = {}
+        self._overflowed_streams: set[str] = set()
         self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
         self._worker_pids: set[int] = set()
@@ -150,6 +156,7 @@ class ExecutorHostClient:
             if not isinstance(item, dict):
                 continue
             kind = str(item.get("kind", "") or "")
+            size = len(pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)) if kind == "service_stream_item" else 0
             with self._cv:
                 if kind == "executor_worker_pids":
                     pid_set: set[int] = set()
@@ -171,6 +178,9 @@ class ExecutorHostClient:
                     continue
                 if kind == "response":
                     request_id = str(item.get("request_id", "") or "")
+                    if request_id in self._overflowed_streams:
+                        self._overflowed_streams.discard(request_id)
+                        continue
                     if request_id in self._expired_requests:
                         self._expired_requests.discard(request_id)
                         continue
@@ -178,9 +188,20 @@ class ExecutorHostClient:
                     self._cv.notify_all()
                 elif kind == "service_stream_item":
                     request_id = str(item.get("request_id", "") or "")
-                    if request_id in self._expired_requests:
-                        self._expired_requests.discard(request_id)
+                    if request_id in self._overflowed_streams:
                         continue
+                    if request_id in self._expired_requests:
+                        continue
+                    buffered = self._stream_buffer_bytes.get(request_id, 0)
+                    if buffered + size > 8 * 1024 * 1024 or len(self._stream_events.get(request_id, ())) >= 128:
+                        self._overflowed_streams.add(request_id)
+                        self._stream_events.pop(request_id, None)
+                        self._stream_buffer_bytes.pop(request_id, None)
+                        self._responses[request_id] = {"ok": False, "error": "stream consumer buffer limit exceeded"}
+                        self._cv.notify_all()
+                        continue
+                    self._stream_buffer_bytes[request_id] = buffered + size
+                    item["_buffer_bytes"] = size
                     self._stream_events.setdefault(request_id, deque()).append(item)
                     self._cv.notify_all()
                 else:
@@ -299,20 +320,28 @@ class ExecutorHostClient:
         if self._closed and action != "shutdown":
             raise RuntimeError("executor host is closed")
         request_payload = dict(payload or {})
-        request_id = self._send_request(action, payload=request_payload)
-        return self._wait_response(request_id, action=action, timeout_sec=timeout_sec, payload=request_payload)
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        request_id = self._send_request(action, payload=request_payload, timeout_sec=timeout_sec)
+        return self._wait_response(request_id, action=action, timeout_sec=max(0.0, deadline - time.monotonic()), payload=request_payload)
 
-    def _send_request(self, action: str, *, payload: Optional[Dict[str, Any]] = None) -> str:
+    def _send_request(self, action: str, *, payload: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> str:
         if self._closed and action != "shutdown":
             raise RuntimeError("executor host is closed")
         with self._cv:
             self._seq += 1
             request_id = f"req-{self._seq}"
-        self._request_q.put({"request_id": request_id, "action": action, "payload": dict(payload or {})})
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        message = pickle.dumps({"request_id": request_id, "action": action, "payload": dict(payload or {})}, protocol=pickle.HIGHEST_PROTOCOL)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"executor host send deadline expired: {action}")
+        try:
+            self._request_q.put(message, timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Full as exc:
+            raise TimeoutError(f"executor host send queue timed out: {action}") from exc
         return request_id
 
     def _wait_response(self, request_id: str, *, action: str, timeout_sec: float, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
         with self._cv:
             while request_id not in self._responses:
                 remaining = deadline - time.monotonic()
@@ -493,13 +522,15 @@ class ExecutorHostClient:
         )
 
     def call_service_stream(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]):
+        deadline = time.monotonic() + max(1.0, float(timeout_sec) + 2.0)
         request_id = self._send_request(
             "call_service_stream",
             payload={"service_id": service_id, "timeout_sec": float(timeout_sec), **dict(execute_spec)},
+            timeout_sec=max(0.0, deadline - time.monotonic()),
         )
-        deadline = time.monotonic() + max(1.0, float(timeout_sec) + 2.0)
 
         def _iter():
+            completed = False
             try:
                 while True:
                     with self._cv:
@@ -516,6 +547,7 @@ class ExecutorHostClient:
                         queue = self._stream_events.get(request_id)
                         if queue:
                             item = queue.popleft()
+                            self._stream_buffer_bytes[request_id] = max(0, self._stream_buffer_bytes.get(request_id, 0) - item.pop("_buffer_bytes", 0))
                             if not queue:
                                 self._stream_events.pop(request_id, None)
                             response = None
@@ -527,6 +559,7 @@ class ExecutorHostClient:
                         continue
                     if response is None:
                         continue
+                    completed = True
                     if not response.get("ok", False):
                         raise RuntimeError(str(response.get("error", "call_service_stream failed")))
                     done_event = dict(response)
@@ -536,7 +569,10 @@ class ExecutorHostClient:
             finally:
                 with self._cv:
                     self._stream_events.pop(request_id, None)
+                    self._stream_buffer_bytes.pop(request_id, None)
                     self._responses.pop(request_id, None)
+                    if not completed:
+                        self._expired_requests.add(request_id)
 
         return _iter()
 

@@ -607,6 +607,7 @@ class LocalServiceIpcServer:
         self._listener: Optional[Listener] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._connection_slots = threading.BoundedSemaphore(128)
 
     def start(self) -> None:
         if _is_metadata_alive(self.service_name):
@@ -676,11 +677,21 @@ class LocalServiceIpcServer:
                 if self._stop.is_set():
                     return
                 continue
-            threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
+            if not self._connection_slots.acquire(blocking=False):
+                conn.close()
+                continue
+            try:
+                threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
+            except BaseException:
+                self._connection_slots.release()
+                conn.close()
+                raise
 
     def _handle_conn(self, conn: Any) -> None:
         try:
             while True:
+                if not conn.poll(30.0) or self._stop.is_set():
+                    return
                 request = conn.recv()
                 if not isinstance(request, dict):
                     raise ValueError("request must be a dict")
@@ -695,6 +706,7 @@ class LocalServiceIpcServer:
         finally:
             with contextlib.suppress(Exception):
                 conn.close()
+            self._connection_slots.release()
 
     def _handle_request(self, request: Dict[str, object]) -> Dict[str, object]:
         action = str(request.get("action", "") or "").strip()

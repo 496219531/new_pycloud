@@ -390,6 +390,14 @@ pycloudctl start \
 
 ## 5. 备注
 
+消息通道的内部固定上限：ExecutorHost 发送队列为 128 条，入队和响应等待共享调用超时预算；
+同步 Python 序列化本身不能被抢占，完成后若预算已耗尽则不发送。
+每条 stream 的 worker 队列最多 32 条，每轮最多转发 32 条；owner 缓冲最多 128 条或 8 MiB
+（按 pickle 大小计）。慢消费者超限会收到 `stream consumer buffer limit exceeded`，不会无限缓存；
+已经运行的用户生成器仍由 executor 的超时和关闭机制处理。
+local IPC 最多接入 128 个连接，等待下一条请求超过 30 秒会关闭空闲连接。
+DEBUG 请求日志只记录 method、URL 和 body 字节数，不打印完整 payload 或 headers。
+
 这些环境变量是“进程启动时读取”的。
 
 也就是说：

@@ -284,7 +284,7 @@ class ExecutorCore:
 
     def _new_stream_queue(self):
         manager = mp.Manager()
-        return manager, manager.Queue()
+        return manager, manager.Queue(maxsize=32)
 
     def _cleanup_stream_state(self, meta: Dict[str, Any]) -> None:
         manager = meta.pop("stream_manager", None)
@@ -352,7 +352,7 @@ class ExecutorCore:
         if not request_id or stream_queue is None:
             return
         emitted = int(meta.get("stream_emitted", 0) or 0)
-        while True:
+        for _ in range(32):
             try:
                 item = stream_queue.get_nowait()
             except Exception:

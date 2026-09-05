@@ -68,11 +68,10 @@ def http_json_request(
 
     url = f"{base_url.rstrip('/')}{path}"
     logger.debug(
-        "http request method=%s url=%s payload=%s headers=%s",
+        "http request method=%s url=%s body_bytes=%s",
         method.upper(),
         url,
-        payload if payload is not None else None,
-        request_headers,
+        len(raw) if raw is not None else 0,
     )
 
     try:

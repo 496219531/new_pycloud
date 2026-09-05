@@ -19,7 +19,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -5962,6 +5962,7 @@ class NodeControlState(NodeRuntimeBase):
         slow_event_count = 0
         for item in events:
             timing_event = None
+            result_snapshot = None
             event_lock_started_at = time.perf_counter()
             with self._cv:
                 kind = str(item.get("kind", "") or "")
@@ -6065,7 +6066,7 @@ class NodeControlState(NodeRuntimeBase):
                         task.error_type = ""
                         task.error_message = ""
                     self._active_pool_task_ids.discard(task_id)
-                    queued_result = task.as_result()
+                    result_snapshot = replace(task)
                     pool.returned_count += 1
                     timing_event = self._record_task_pool_timing_locked(
                         pool,
@@ -6082,11 +6083,25 @@ class NodeControlState(NodeRuntimeBase):
                     )
                     result_hook = self._pool_result_hook
                     self._cv.notify_all()
-                    if queued_result is not None:
-                        result_hook.push(pool_id, queued_result)
                     if status_text == DEPENDENCY_FAILURE_STATUS:
                         self._mark_task_pool_dependency_failure_locked(pool, reason=normalized_error_message)
             event_lock_sec = time.perf_counter() - event_lock_started_at
+            if result_snapshot is not None:
+                try:
+                    queued_result = result_snapshot.as_result()
+                except Exception as exc:
+                    result_snapshot.result = None
+                    result_snapshot.status = pb2.TASK_STATUS_FAILED_INFRA
+                    result_snapshot.error_type = "SerializationError"
+                    result_snapshot.error_message = str(exc)
+                    queued_result = result_snapshot.as_result()
+                with self._cv:
+                    current = self._pool_tasks.get(result_snapshot.task_id)
+                    if current is task and current.attempt == result_snapshot.attempt:
+                        current.status = result_snapshot.status
+                        current.error_type = result_snapshot.error_type
+                        current.error_message = result_snapshot.error_message
+                        result_hook.push(pool_id, queued_result)
             total_lock_sec += event_lock_sec
             if event_lock_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC:
                 slow_event_count += 1
