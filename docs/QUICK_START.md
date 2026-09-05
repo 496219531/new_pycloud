@@ -131,7 +131,9 @@ node.join()
 
 这条路径不会接受 `Service.deploy(...)` 的动态部署；需要动态部署时仍使用普通 `NodeControl` 节点。
 如果脚本启动后立刻退出，本地 `18080` 端口也会随进程关闭，浏览器访问会看到连接被拒绝；长驻场景需要像上面一样调用 `node.join()` 或用自己的主循环保持进程运行。
-`Service.startup(...)` 默认走 module-first 路径：主推传入已 import 的 module：`source=calc_service`，或传 `entry_module="..."` 让本进程 import 后直接挂载。startup 是本机快启动语义，不做远程 upload code；需要模拟真实部署、打包、资源文件和依赖处理时，用 `Service.deploy(target="local", ...)`。启动前必须可见的运行配置建议通过 `initial_globals={...}` 注入，后续热更新再用 owner handle 的 `update_globals(...)`；不要用 `cwd` / `os.environ` 这类进程全局状态影响同进程内其它服务。
+`Service.startup(...)` 默认走 module-first 路径：主推传入已 import 的 module：`source=calc_service`，或传 `entry_module="..."`。startup 不打包或上传业务源码，worker 进程直接从本机 Python import path 加载该 module；`worker_count=N` 对应本地 `ProcessPoolExecutor` 的 N 个计算进程，不是 HTTP 工作线程。需要模拟真实部署、完整 artifact、资源文件和依赖处理时，用 `Service.deploy(target="local", ...)`。启动前必须可见的运行配置建议通过 `initial_globals={...}` 注入，后续热更新再用 owner handle 的 `update_globals(...)`；不要用 `cwd` / `os.environ` 这类进程全局状态影响同进程内其它服务。
+
+只有必须与 owner 进程共享内存状态的控制型系统服务才应显式使用 `worker_backend="inline"`；普通业务计算不要使用 inline。inline service 仍可由 HTTP/IPC 并发接入，但每个 service 的实际函数执行由独立 semaphore 限制为 `worker_count`。
 
 不传 `target` 时，startup service 只在当前进程本地运行并暴露 service HTTP，不注册到 `InfoCenter`。这是 startup 专属的未注册模式，不等于通用 local 模式；`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`。未来本地 IPC 模式只通过 `target="local"` 触发。
 

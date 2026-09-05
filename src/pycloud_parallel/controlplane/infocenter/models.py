@@ -35,7 +35,12 @@ class NodeServiceState:
     resource_health: str = ""
     degraded: bool = False
     worker_count: int = 0
+    requested_workers: int = 0
     alive_workers: int = 0
+    busy_workers: int = 0
+    queued: int = 0
+    worker_pids: tuple[int, ...] = ()
+    executor_generation: int = 0
     in_flight: int = 0
     received_count: int = 0
     returned_count: int = 0

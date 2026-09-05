@@ -41,6 +41,8 @@ class ExecutorBackend(Protocol):
 
     def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]: ...
 
+    def resource_worker_pids(self) -> Dict[Tuple[str, str], Tuple[int, ...]]: ...
+
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None: ...
 
     def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None: ...
@@ -234,6 +236,14 @@ class SubprocessExecutorBackend:
                     out[(normalized_kind, str(resource_id))] = int(alive)
                 continue
             out[("task_pool", str(pool_id))] = 0
+        return out
+
+    def resource_worker_pids(self) -> Dict[Tuple[str, str], Tuple[int, ...]]:
+        out: Dict[Tuple[str, str], Tuple[int, ...]] = {}
+        with self._clients_lock:
+            clients = tuple(self._service_clients.values()) + tuple(self._pool_clients.values())
+        for client in clients:
+            out.update(client.resource_worker_pids())
         return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:

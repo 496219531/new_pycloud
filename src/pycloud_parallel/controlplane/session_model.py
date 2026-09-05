@@ -72,6 +72,11 @@ class WorkerResourceSnapshot:
     in_flight: int
     received_count: int
     returned_count: int
+    requested_workers: int = 0
+    busy_workers: int = 0
+    queued: int = 0
+    worker_pids: tuple[int, ...] = ()
+    executor_generation: int = 0
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import io
 import os
@@ -2367,7 +2368,7 @@ def test_connected_service_does_not_expose_owner_shutdown_methods():
     connected.close()
 
 
-def test_service_startup_uses_mounted_module_service(tmp_path, monkeypatch):
+def test_service_startup_uses_process_backed_module_service(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_calc_service.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -2390,9 +2391,10 @@ def test_service_startup_uses_mounted_module_service(tmp_path, monkeypatch):
 
         assert isinstance(node, NodeControlState)
         assert node.accept_service_deploy is False
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
-        assert mount.worker_count == 2
-        assert not node._services  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        assert session.worker_count == 2
+        assert session.executor_ready is True
+        assert not node._startup_services  # noqa: SLF001
         assert node.methods == ["add"]
         assert node.list_methods(include_docs=True)[0]["method"] == "add"
 
@@ -2448,15 +2450,15 @@ def test_service_startup_initial_globals_module_mount_before_visible(tmp_path, m
         start=False,
     )
     try:
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
         assert node.service_report_payloads()[0]["status"] == pb2.SERVICE_STATUS_RUNNING
-        assert mount.globals_digest
+        assert session.managed_globals_digest
         assert node.read_cfg.sync() == {"value": 42}
     finally:
         node.close()
 
 
-def test_service_startup_module_source_defaults_to_module_mount(tmp_path, monkeypatch):
+def test_service_startup_module_source_defaults_to_process_executor(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_module_source_default.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -2474,11 +2476,172 @@ def test_service_startup_module_source_defaults_to_module_mount(tmp_path, monkey
         start=False,
     )
     try:
-        assert node._services == {}  # noqa: SLF001
-        assert node._startup_services  # noqa: SLF001
+        assert node._services  # noqa: SLF001
+        assert node._startup_services == {}  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        artifact = node._codes[session.code_version]  # noqa: SLF001
+        assert artifact.source_kind == "module_import"
+        assert artifact.entry_module == "startup_module_source_default"
+        assert Path(artifact.path) == tmp_path
         assert node.add.sync(x=2, y=5) == {"value": 7}
     finally:
         node.close()
+
+
+def test_service_startup_worker_count_creates_parallel_processes(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_process_workers.py"
+    module_path.write_text(
+        "import os\n"
+        "import time\n"
+        "def worker_pid(delay=0.1):\n"
+        "    time.sleep(float(delay))\n"
+        "    return os.getpid()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        entry_module="startup_process_workers",
+        service_name="startup-process-workers",
+        export_methods=("worker_pid",),
+        worker_count=2,
+        start=False,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            worker_pids = set(executor.map(lambda _index: node.worker_pid.sync(delay=0.2), range(4)))
+        assert len(worker_pids) == 2
+        assert os.getpid() not in worker_pids
+        status = node.service_status_info(node.service_id)
+        assert status["requested_workers"] == 2
+        assert status["alive_workers"] == 2
+        assert set(status["worker_pids"]) == worker_pids
+        assert status["executor_generation"] == 1
+    finally:
+        node.close()
+
+
+def test_service_startup_inline_backend_is_explicit(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_inline_worker.py"
+    module_path.write_text(
+        "import os\n"
+        "def worker_pid():\n"
+        "    return os.getpid()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        entry_module="startup_inline_worker",
+        service_name="startup-inline-worker",
+        export_methods=("worker_pid",),
+        worker_backend="inline",
+        start=False,
+    )
+    try:
+        assert node._startup_services  # noqa: SLF001
+        assert node._services == {}  # noqa: SLF001
+        assert node.worker_pid.sync() == os.getpid()
+    finally:
+        node.close()
+
+
+def test_service_startup_inline_backend_honors_worker_count(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_inline_capacity.py"
+    module_path.write_text(
+        "import threading\n"
+        "import time\n"
+        "_lock = threading.Lock()\n"
+        "_active = 0\n"
+        "_max_active = 0\n"
+        "def work(delay=0.1):\n"
+        "    global _active, _max_active\n"
+        "    with _lock:\n"
+        "        _active += 1\n"
+        "        _max_active = max(_max_active, _active)\n"
+        "    try:\n"
+        "        time.sleep(float(delay))\n"
+        "        return _max_active\n"
+        "    finally:\n"
+        "        with _lock:\n"
+        "            _active -= 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        entry_module="startup_inline_capacity",
+        service_name="startup-inline-capacity",
+        export_methods=("work",),
+        worker_count=2,
+        worker_backend="inline",
+        start=False,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            observed = list(executor.map(lambda _index: node.work.sync(delay=0.1), range(8)))
+        assert max(observed) == 2
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        assert mount.in_flight == 0
+        assert mount.queued == 0
+    finally:
+        node.close()
+
+
+def test_service_startup_inline_stream_holds_worker_slot(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_inline_stream_capacity.py"
+    module_path.write_text(
+        "import threading\n"
+        "import time\n"
+        "started = threading.Event()\n"
+        "def stream(delay=0.2):\n"
+        "    started.set()\n"
+        "    time.sleep(float(delay))\n"
+        "    yield 1\n"
+        "def ping():\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    module = importlib.import_module("startup_inline_stream_capacity")
+
+    node = Service.startup(
+        source=module,
+        service_name="startup-inline-stream-capacity",
+        export_methods=("stream", "ping"),
+        worker_count=1,
+        worker_backend="inline",
+        start=False,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            stream_future = executor.submit(lambda: list(node.stream.stream(delay=0.2)))
+            assert module.started.wait(timeout=1.0)
+            started_at = time.monotonic()
+            assert node.ping.sync() == "ok"
+            elapsed_sec = time.monotonic() - started_at
+            assert stream_future.result(timeout=1.0) == [1]
+        assert elapsed_sec >= 0.15
+    finally:
+        node.close()
+
+
+def test_service_startup_rejects_unknown_worker_backend(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_unknown_backend.py"
+    module_path.write_text("def run():\n    return None\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    with pytest.raises(ValueError, match="worker_backend"):
+        Service.startup(
+            entry_module="startup_unknown_backend",
+            worker_backend="threads",
+            start=False,
+        )
 
 
 def test_service_startup_explicit_package_format_keeps_prepared_service_path(tmp_path, monkeypatch):
@@ -2558,7 +2721,7 @@ def test_service_startup_local_proxy_streams(tmp_path, monkeypatch):
         node.close()
 
 
-def test_service_startup_local_stream_uses_direct_pickle_object_path(tmp_path, monkeypatch):
+def test_service_startup_local_stream_uses_process_executor_path(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_shared_invoke_service.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -2589,7 +2752,7 @@ def test_service_startup_local_stream_uses_direct_pickle_object_path(tmp_path, m
     try:
         assert node.add.sync(x=2, y=5) == {"value": 7}
         assert list(node.count.stream(limit=2)) == [1, 2]
-        assert calls == [False]
+        assert calls == [False, True]
     finally:
         node.close()
 
@@ -2653,7 +2816,7 @@ def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
         service.close()
 
 
-def test_service_deploy_local_defaults_to_direct_module_path(tmp_path, monkeypatch):
+def test_service_deploy_local_defaults_to_direct_module_process_path(tmp_path, monkeypatch):
     worker_module = _build_service_entry_module(tmp_path, monkeypatch)
 
     service = Service.deploy(
@@ -2663,8 +2826,8 @@ def test_service_deploy_local_defaults_to_direct_module_path(tmp_path, monkeypat
         worker_count=1,
     )
     try:
-        assert service._services == {}  # noqa: SLF001
-        assert service._startup_services  # noqa: SLF001
+        assert service._services  # noqa: SLF001
+        assert service._startup_services == {}  # noqa: SLF001
         assert service.run.sync(value=3) == {"value": 3}
     finally:
         service.close()
@@ -3611,7 +3774,7 @@ def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", _fake_infocenter)
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.node_runtime_base.NodeRuntimeBase.start_mounted_service_gateway",
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_node_service_gateway",
         _fake_start_gateway,
     )
     monkeypatch.setattr(
@@ -3717,7 +3880,7 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
         from pycloud_parallel.data.ref import DataRef
         from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
         source = tmp_path / "payload.txt"
         source.write_text("startup-http-result", encoding="utf-8")
         artifact = node.data_store.store_path(source)
@@ -3729,7 +3892,7 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
             size_bytes=artifact.size_bytes,
             materialize_as="text",
             locator_kind="service_http",
-            locator_token=mount.http_base_url,
+            locator_token=session.http_base_url,
             node_id=node.node_id,
         )
 
@@ -3878,9 +4041,9 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
 
     try:
         assert node.service_worker_capacity == 3
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
-        assert mount.policy_id == "trusted_internal"
-        assert not node._services  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        assert session.policy_id == "trusted_internal"
+        assert not node._startup_services  # noqa: SLF001
         assert calls == [
                 {
                     "infocenter_target": "127.0.0.1:50051",
@@ -3901,7 +4064,7 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
         node.close()
 
 
-def test_service_startup_update_globals_uses_mounted_module_path(tmp_path, monkeypatch):
+def test_service_startup_update_globals_uses_process_service_path(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_globals_service.py"
     module_path.write_text(
         "cfg = None\n"
@@ -3921,7 +4084,7 @@ def test_service_startup_update_globals_uses_mounted_module_path(tmp_path, monke
     )
 
     try:
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
         code, body = node._invoke_local_startup_service(  # noqa: SLF001
             "read_cfg",
             {},
@@ -3943,13 +4106,13 @@ def test_service_startup_update_globals_uses_mounted_module_path(tmp_path, monke
         assert code == 200
         assert body["data"] == {"value": 42}
         assert first_digest
-        assert mount.globals_digest == first_digest
-        assert node.globals_digests == {mount.service_id: first_digest}
+        assert session.managed_globals_digest == first_digest
+        assert node.globals_digests == {session.service_id: first_digest}
     finally:
         node.close()
 
 
-def test_service_startup_update_globals_applies_to_mounted_module(tmp_path, monkeypatch):
+def test_service_startup_update_globals_applies_to_worker_module(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_globals_recreate_service.py"
     module_path.write_text(
         "cfg = None\n"
@@ -3969,7 +4132,7 @@ def test_service_startup_update_globals_applies_to_mounted_module(tmp_path, monk
     )
 
     try:
-        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        session = next(iter(node._services.values()))  # noqa: SLF001
 
         digest = node.update_globals({"cfg": {"value": 43}})
         code, body = node._invoke_local_startup_service(  # noqa: SLF001
@@ -3983,7 +4146,7 @@ def test_service_startup_update_globals_applies_to_mounted_module(tmp_path, monk
         assert digest
         assert code == 200
         assert body["data"] == {"value": 43}
-        assert mount.globals_digest == digest
+        assert session.managed_globals_digest == digest
     finally:
         node.close()
 

@@ -138,14 +138,10 @@ def test_task_pool_open_local_uses_private_node_pool(tmp_path) -> None:
         assert pool.route_summary()[0]["control_addr"] == "local"
 
 
-def test_task_pool_open_local_module_defaults_to_direct_no_package(tmp_path, monkeypatch) -> None:
+def test_task_pool_open_local_module_uses_process_runtime(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
     worker_module = _build_task_entry_module(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "pycloud_parallel.execution.task_pool._prepare_artifact",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct module must not package")),
-    )
 
     with TaskPool.open(
         target="local",
@@ -156,16 +152,49 @@ def test_task_pool_open_local_module_defaults_to_direct_no_package(tmp_path, mon
         assert pool.route_summary()[0]["control_addr"] == "local"
 
 
-def test_task_pool_open_local_callable_defaults_to_direct_no_package(monkeypatch) -> None:
+def test_task_pool_open_local_worker_count_creates_parallel_processes(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
-    def run(value=0, **_kwargs):
-        return {"value": int(value) + 2}
-
-    monkeypatch.setattr(
-        "pycloud_parallel.execution.task_pool._prepare_artifact",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    module_path = tmp_path / "local_taskpool_process_workers.py"
+    module_path.write_text(
+        "import os\n"
+        "import time\n"
+        "def run(delay=0.1):\n"
+        "    time.sleep(float(delay))\n"
+        "    return os.getpid()\n",
+        encoding="utf-8",
     )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker_module = importlib.import_module("local_taskpool_process_workers")
+
+    with TaskPool.open(
+        target="local",
+        source=worker_module,
+        worker_count=2,
+    ) as pool:
+        worker_pids = {
+            result
+            for _index, result in pool.unordered(
+                [{"delay": 0.2} for _ in range(4)],
+                timeout_sec=10.0,
+            )
+        }
+        assert len(worker_pids) == 2
+
+
+def test_task_pool_open_local_callable_uses_process_runtime(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    module_path = tmp_path / "local_callable_add.py"
+    module_path.write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': int(value) + 2}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    run = importlib.import_module("local_callable_add").run
 
     with TaskPool.open(
         target="local",
@@ -175,16 +204,28 @@ def test_task_pool_open_local_callable_defaults_to_direct_no_package(monkeypatch
         assert pool.collect_items([{"value": 6}], timeout_sec=10.0)[0].result == {"value": 8}
 
 
-def test_task_pool_open_local_callable_preserves_dict_int_scalar(monkeypatch) -> None:
+def test_task_pool_open_local_rejects_nested_callable() -> None:
     from pycloud_parallel import TaskPool
 
-    def run(inner_code=None, **_kwargs):
-        return {"value": inner_code, "type": type(inner_code).__name__}
+    def run(value=0):
+        return value
 
-    monkeypatch.setattr(
-        "pycloud_parallel.execution.task_pool._prepare_artifact",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    with pytest.raises(ValueError, match="module-level callable"):
+        TaskPool.open(target="local", source=run, worker_count=1)
+
+
+def test_task_pool_open_local_callable_preserves_dict_int_scalar(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    module_path = tmp_path / "local_callable_scalar.py"
+    module_path.write_text(
+        "def run(inner_code=None, **_kwargs):\n"
+        "    return {'value': inner_code, 'type': type(inner_code).__name__}\n",
+        encoding="utf-8",
     )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    run = importlib.import_module("local_callable_scalar").run
 
     with TaskPool.open(
         target="local",
@@ -195,24 +236,26 @@ def test_task_pool_open_local_callable_preserves_dict_int_scalar(monkeypatch) ->
         assert result == {"value": 83996, "type": "int"}
 
 
-def test_task_pool_open_local_callable_accepts_date_time_args_kwargs(monkeypatch) -> None:
+def test_task_pool_open_local_callable_accepts_date_time_args_kwargs(tmp_path, monkeypatch) -> None:
     pd = pytest.importorskip("pandas")
     from pycloud_parallel import TaskPool
 
-    def run(day, *, asof=None, timestamp=None):
-        return {
-            "day_type": type(day).__name__,
-            "day": day.isoformat(),
-            "asof_type": type(asof).__name__,
-            "asof": asof.isoformat(),
-            "timestamp_type": type(timestamp).__name__,
-            "timestamp": timestamp.isoformat(),
-        }
-
-    monkeypatch.setattr(
-        "pycloud_parallel.execution.task_pool._prepare_artifact",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    module_path = tmp_path / "local_callable_datetime.py"
+    module_path.write_text(
+        "def run(day, *, asof=None, timestamp=None):\n"
+        "    return {\n"
+        "        'day_type': type(day).__name__,\n"
+        "        'day': day.isoformat(),\n"
+        "        'asof_type': type(asof).__name__,\n"
+        "        'asof': asof.isoformat(),\n"
+        "        'timestamp_type': type(timestamp).__name__,\n"
+        "        'timestamp': timestamp.isoformat(),\n"
+        "    }\n",
+        encoding="utf-8",
     )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    run = importlib.import_module("local_callable_datetime").run
 
     with TaskPool.open(
         target="local",

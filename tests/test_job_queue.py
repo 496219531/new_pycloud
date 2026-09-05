@@ -2661,7 +2661,7 @@ def test_job_queue_client_local_submit_source_module_uses_import_metadata(tmp_pa
     assert "blob_ref" not in captured
 
 
-def test_job_queue_manager_local_module_import_creates_direct_local_taskpool(tmp_path, monkeypatch) -> None:
+def test_job_queue_manager_local_module_import_creates_local_taskpool(tmp_path, monkeypatch) -> None:
     import importlib
 
     from pycloud_parallel.controlplane.job_queue import JobQueueManager

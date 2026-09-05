@@ -42,7 +42,11 @@ node.join()
 它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
 如果启动脚本退出，startup service 也会随进程关闭；长驻服务应调用 `node.join()` 或用自己的主循环保持进程运行。
 
-主推写法是 `source=imported_module`。这种形式默认走本地 module mount，不做远程代码上传，也不再把已 import 的 module 重新打包成远端 deploy artifact。运行配置建议通过 `managed_global_names` + `update_globals(...)` 注入，避免 `cwd` / `os.environ` 这类进程全局状态污染同进程内其它服务。显式 `entry_module=...`、bytes/path artifact 或显式 `package_format=...` 仍保留为兼容/边缘路径。
+主推写法是 `source=imported_module`。这种形式不做远程代码上传，也不把已 import 的 module 重新打包成远端 deploy artifact；本地 `ProcessPoolExecutor` worker 直接按模块名导入本地文件，`worker_count` 表示真实计算进程数。运行配置建议通过 `managed_global_names` + `update_globals(...)` 注入，避免 `cwd` / `os.environ` 这类进程全局状态污染同进程内其它服务。显式 bytes/path artifact 或非 module `package_format` 仍保留为完整 artifact 路径。
+
+`worker_backend` 默认是 `"process"`。`"inline"` 只用于必须与 owner 共享内存状态的内置控制服务；它会在服务进程的 HTTP/IPC 工作线程中执行用户函数，并通过 service 独立 semaphore 将实际执行并发限制为 `worker_count`，不适合 CPU 密集计算。
+
+内部 worker 状态统一包含 `requested_workers/alive_workers/busy_workers/queued/in_flight/worker_pids/executor_generation`。原有 `worker_count` 保留为实际获批进程数；新增字段通过 status/inventory 字典兼容输出，不改变现有 protobuf 字段编号。执行错误同时提供稳定 `error_code`：`UserCodeError`、`DependencyError`、`WorkerCrashed`、`ExecutorUnavailable`、`CallTimeout`、`QueueFull` 或 `SerializationError`。
 
 如果 `target` 为空，`Service.startup(...)` 只在当前进程启动本地 HTTP service，不注册到 `InfoCenter`，也不参与 `InfoCenter` 的 `service_name` 全局排他检查。这是 startup 专属的未注册模式，不等于 `target="local"` 的本地 IPC 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 等其它入口仍然必须显式传入 `target`；未来的 local 模式也必须显式写成 `target="local"`。
 

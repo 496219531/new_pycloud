@@ -51,6 +51,7 @@ class CodeArtifact:
     dependency_path: str
     size_bytes: int
     created_at: datetime
+    source_kind: str = "artifact"
 
 
 @dataclass
@@ -166,6 +167,9 @@ class ServiceSession:
     request_count: int = 0
     returned_count: int = 0
     node_managed: bool = False
+    requested_workers: int = 0
+    worker_pids: Tuple[int, ...] = ()
+    executor_generation: int = 1
 
     def is_running(self) -> bool:
         return int(self.status or 0) in {
@@ -188,6 +192,11 @@ class ServiceSession:
             in_flight=normalized_in_flight,
             received_count=normalized_received,
             returned_count=normalized_returned,
+            requested_workers=max(0, int(self.requested_workers or self.worker_count or 0)),
+            busy_workers=min(max(0, int(self.alive_workers or 0)), normalized_in_flight),
+            queued=max(0, int(self.queued or 0)),
+            worker_pids=tuple(sorted(int(pid) for pid in self.worker_pids if int(pid) > 0)),
+            executor_generation=max(0, int(self.executor_generation or 0)),
         )
 
     def identity(self) -> SessionIdentity:
@@ -282,6 +291,9 @@ class TaskPoolState:
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
     method_failures: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    requested_workers: int = 0
+    worker_pids: Tuple[int, ...] = ()
+    executor_generation: int = 1
 
     def is_running(self) -> bool:
         return str(self.status or "").strip().upper() == "RUNNING"
@@ -301,6 +313,11 @@ class TaskPoolState:
             in_flight=normalized_in_flight,
             received_count=normalized_received,
             returned_count=normalized_returned,
+            requested_workers=max(0, int(self.requested_workers or self.worker_count or 0)),
+            busy_workers=min(alive_workers, normalized_in_flight),
+            queued=max(0, normalized_received - normalized_returned - normalized_in_flight),
+            worker_pids=tuple(sorted(int(pid) for pid in self.worker_pids if int(pid) > 0)),
+            executor_generation=max(0, int(self.executor_generation or 0)),
         )
 
     def identity(self) -> SessionIdentity:

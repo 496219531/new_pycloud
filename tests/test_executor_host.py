@@ -421,9 +421,10 @@ def test_executor_core_falls_back_to_spawn_when_fork_submit_fails(monkeypatch, r
     monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
 
     class _FakeExecutor:
-        def __init__(self, max_workers, mp_context):
+        def __init__(self, max_workers, mp_context, initializer=None):
             self.max_workers = max_workers
             self.mp_context = mp_context
+            self.initializer = initializer
 
         def shutdown(self, **_kwargs):
             pass
@@ -472,9 +473,10 @@ def test_executor_core_background_submit_falls_back_to_spawn_when_fork_fails(mon
     monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
 
     class _FakeExecutor:
-        def __init__(self, max_workers, mp_context):
+        def __init__(self, max_workers, mp_context, initializer=None):
             self.max_workers = max_workers
             self.mp_context = mp_context
+            self.initializer = initializer
 
         def shutdown(self, **_kwargs):
             pass
@@ -510,9 +512,10 @@ def test_executor_core_background_submit_falls_back_to_spawn_when_fork_fails(mon
 
 def test_executor_core_background_completion_reemits_worker_pids(monkeypatch):
     class _FakeExecutor:
-        def __init__(self, max_workers, mp_context):
+        def __init__(self, max_workers, mp_context, initializer=None):
             self.max_workers = max_workers
             self.mp_context = mp_context
+            self.initializer = initializer
             self._processes = {}
 
         def shutdown(self, **_kwargs):

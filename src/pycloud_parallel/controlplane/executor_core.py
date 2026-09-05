@@ -9,6 +9,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import signal
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -17,6 +18,11 @@ from pycloud_parallel.runtime.executors import _shutdown_executor
 logger = logging.getLogger(__name__)
 
 EmitFunc = Callable[[Dict[str, Any]], None]
+
+
+def _initialize_executor_worker() -> None:
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def submit_callable_to_worker(executor: ProcessPoolExecutor, args: Dict[str, Any]):
@@ -43,7 +49,9 @@ def submit_callable_to_worker(executor: ProcessPoolExecutor, args: Dict[str, Any
         str(args.get("payload_mode", "task_submit") or "task_submit"),
         str(args.get("serialization_mode", "") or "").strip().lower(),
         args.get("use_transport_result", None),
+        dict(args.get("invoke_context") or {}),
         args.get("stream_queue", None),
+        str(args.get("source_kind", "artifact") or "artifact"),
     )
 
 
@@ -107,6 +115,7 @@ def prepare_artifact_in_host(args: Dict[str, Any]) -> Dict[str, Any]:
             export_methods=tuple(args.get("export_methods", ()) or ()),
             export_decorator=str(args.get("export_decorator", "") or ""),
             entry_callable=entry_callable,
+            source_kind=str(args.get("source_kind", "artifact") or "artifact"),
         )
         managed_global_names = _normalize_managed_global_names(args.get("managed_global_names", ()) or ())
         if managed_global_names and _resolve_apply_managed_globals_hook(module) is None:
@@ -387,11 +396,19 @@ class ExecutorCore:
     def _new_process_pool(self, *, max_workers: int, force_spawn: bool = False) -> ProcessPoolExecutor:
         try:
             context = self._spawn_mp_context() if force_spawn else self._ensure_mp_context()
-            return ProcessPoolExecutor(max_workers=max_workers, mp_context=context)
+            return ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=context,
+                initializer=_initialize_executor_worker,
+            )
         except Exception as exc:
             if not force_spawn and self._should_fallback_to_spawn(exc):
                 logger.warning("fork process pool startup failed; falling back to spawn: %r", exc)
-                return ProcessPoolExecutor(max_workers=max_workers, mp_context=self._spawn_mp_context())
+                return ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    mp_context=self._spawn_mp_context(),
+                    initializer=_initialize_executor_worker,
+                )
             raise
 
     @staticmethod

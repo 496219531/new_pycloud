@@ -12,14 +12,6 @@ from urllib.parse import unquote
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
-from pycloud_parallel.controlplane.node.execution import (
-    _apply_managed_globals_to_router,
-    _build_execute_spec,
-    _invoke_local_user_callable,
-    _load_callable_router,
-)
-from pycloud_parallel.controlplane.node.filesystem import _code_data_dir
-from pycloud_parallel.controlplane.node.results import _resolve_object_refs_in_payload
 from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
 from pycloud_parallel.controlplane.serialization import (
@@ -64,6 +56,37 @@ class StartupServiceNode(NodeControlState):
         self.accept_service_deploy = True
         try:
             session = super().create_service(**kwargs)
+        finally:
+            self.accept_service_deploy = previous_accept_service_deploy
+        session.node_managed = True
+        self._local_service_id = str(session.service_id or "")
+        self._local_service_token = str(session.service_token or "")
+        self._local_service_name = str(session.service_name or "")
+        self._local_owner_client_id = str(session.owner_client_id or "")
+        self._local_code_version = str(session.code_version or "")
+        self._local_policy_id = str(session.policy_id or "")
+        self._local_service_methods = sorted(str(name) for name in getattr(session, "methods", {}).keys())
+        return session
+
+    def mount_local_module_service(self, *, artifact, **kwargs: Any):
+        previous_accept_service_deploy = bool(getattr(self, "accept_service_deploy", False))
+        self.accept_service_deploy = True
+        try:
+            session = super().create_service(
+                sha256=artifact.code_version,
+                runtime=artifact.runtime,
+                entry_module=artifact.entry_module,
+                entry_callable=artifact.entry_callable,
+                package_format=artifact.package_format,
+                export_mode=artifact.export_mode,
+                export_methods=list(artifact.export_methods),
+                export_decorator=artifact.export_decorator,
+                dependency_policy_mode=artifact.dependency_policy_mode,
+                dependency_allowlist=list(artifact.dependency_allowlist),
+                chunks=(),
+                local_artifact=artifact,
+                **kwargs,
+            )
         finally:
             self.accept_service_deploy = previous_accept_service_deploy
         session.node_managed = True
@@ -251,17 +274,6 @@ class StartupServiceNode(NodeControlState):
                 use_transport_result=stream_response,
                 stream_response=stream_response,
             )
-        if self._local_ipc_server is not None and not stream_response:
-            local_handled = self._invoke_local_service_inline(
-                service_id=service_id,
-                method=method,
-                payload=normalized_payload,
-                service_token=self._local_service_token,
-                timeout_sec=timeout_sec,
-                serialization_mode=serialization_mode,
-            )
-            if local_handled is not None:
-                return local_handled
         if stream_response:
             return self._invoke_service_stream_http(
                 service_id=service_id,
@@ -280,133 +292,6 @@ class StartupServiceNode(NodeControlState):
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
         )
-
-    def _invoke_local_service_inline(
-        self,
-        *,
-        service_id: str,
-        method: str,
-        payload: dict,
-        service_token: str,
-        timeout_sec: float,
-        serialization_mode: str,
-    ):
-        del timeout_sec
-        requested_method = str(method or "").strip()
-        if not requested_method:
-            return 400, {"ok": False, "error": "method is required"}
-        with self._lock:
-            session = self._services.get(service_id)
-            if session is None:
-                return None
-            if not session.is_running():
-                return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
-            if not self._service_token_allowed(session, service_token):
-                return 401, {"ok": False, "error": "invalid service token"}
-            if requested_method not in session.methods:
-                return 404, {"ok": False, "error": f"method not found: {requested_method}"}
-            artifact = self._codes.get(session.code_version)
-            if artifact is None:
-                return 500, {"ok": False, "error": "artifact missing"}
-            session.request_count += 1
-            session.in_flight = self._service_inflight_locked(session)
-            prepared_payload = (
-                payload
-                if is_inline_transport_carrier(payload)
-                else self._resolve_memory_object_refs_in_payload_locked(payload or {})
-            )
-        try:
-            spec = _build_execute_spec(
-                artifact,
-                object_dir=self._object_dir,
-                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                method_name=requested_method,
-                payload=prepared_payload,
-                payload_mode="http_call",
-                serialization_mode=str(serialization_mode or "").strip().lower(),
-                use_transport_result=None,
-                managed_globals_scope_dir=session.managed_globals_scope_dir,
-                managed_globals_digest=session.managed_globals_digest,
-            )
-            module, router, _method_info = _load_callable_router(
-                spec["artifact_path"],
-                entry_module=spec["entry_module"],
-                package_format=spec["package_format"],
-                dependency_path=spec["dependency_path"],
-                export_mode=spec["export_mode"],
-                export_methods=spec["export_methods"],
-                export_decorator=spec["export_decorator"],
-                entry_callable=spec["entry_callable"],
-            )
-            fn = router.get(requested_method)
-            if fn is None:
-                return 404, {"ok": False, "error": f"method not found: {requested_method}"}
-            _apply_managed_globals_to_router(
-                module,
-                router,
-                scope_dir=str(spec.get("managed_globals_scope_dir", "") or ""),
-                globals_digest=str(spec.get("managed_globals_digest", "") or ""),
-                object_dir=spec["object_dir"],
-                entry_module=spec["entry_module"],
-                method_name=requested_method,
-                session_kind="service",
-            )
-            inbound_payload = (
-                decode_inline_transport_carrier(
-                    spec["payload"],
-                    context="service_owner",
-                    limit_bytes=0,
-                )
-                if is_inline_transport_carrier(spec["payload"])
-                else spec["payload"]
-            )
-            resolved_payload = _resolve_object_refs_in_payload(inbound_payload or {}, object_dir=spec["object_dir"])
-            ret = _invoke_local_user_callable(fn, resolved_payload)
-            status_text, result, err_type, err_message = self._normalize_local_inline_result(ret)
-        except Exception as exc:
-            with self._lock:
-                session = self._services.get(service_id)
-                if session is not None:
-                    session.returned_count += 1
-                    session.in_flight = self._service_inflight_locked(session)
-            return 500, {"ok": False, "error": repr(exc)}
-
-        with self._lock:
-            session = self._services.get(service_id)
-            if session is not None:
-                session.returned_count += 1
-                session.in_flight = self._service_inflight_locked(session)
-        if status_text == "SUCCEEDED":
-            return 200, {"ok": True, "method": requested_method, "data": {} if result is None else result}
-        status = 400 if status_text == "FAILED_USER" else 503
-        return status, {
-            "ok": False,
-            "method": requested_method,
-            "error_type": err_type or status_text,
-            "error": err_message or err_type or f"service call failed status={status_text}",
-        }
-
-    @staticmethod
-    def _normalize_local_inline_result(value: Any) -> tuple[str, Any, str, str]:
-        def _status(raw: Any) -> str:
-            text = str(raw or "SUCCEEDED").strip().upper()
-            if text in {"SUCCESS", "OK"}:
-                return "SUCCEEDED"
-            if text in {"SUCCEEDED", "FAILED_USER", "FAILED_INFRA", "FAILED_DEPENDENCY"}:
-                return text
-            return "SUCCEEDED"
-
-        if isinstance(value, tuple) and len(value) == 4:
-            status_text, result, error_type, error_message = value
-            return _status(status_text), result, str(error_type or ""), str(error_message or "")
-        if isinstance(value, dict) and "status" in value:
-            return (
-                _status(value.get("status")),
-                value.get("result"),
-                str(value.get("error_type", "") or ""),
-                str(value.get("error_message", "") or ""),
-            )
-        return "SUCCEEDED", value, "", ""
 
     def call_balanced(
         self,
@@ -473,7 +358,8 @@ class StartupServiceNode(NodeControlState):
         service_id = self._resolve_local_startup_service_id()
         mounted_service = self._mounted_service(service_id)
         if mounted_service is not None and callable(mounted_service.stream_handler):
-            for item in mounted_service.stream_handler(
+            for item in self._iter_mounted_startup_service(
+                service_id,
                 method,
                 dict(payload or {}),
                 self._local_service_token,

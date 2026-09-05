@@ -20,7 +20,7 @@ import uuid
 import tarfile
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -65,6 +65,8 @@ _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
 _MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
 _MANAGED_GLOBALS_APPLY_LOCKS: Dict[str, threading.Lock] = {}
 _NATIVE_PATH = type(Path())
+SOURCE_KIND_ARTIFACT = "artifact"
+SOURCE_KIND_MODULE_IMPORT = "module_import"
 
 
 def _path(value: Any = ".") -> Path:
@@ -88,11 +90,13 @@ class ExecuteSpec:
     method_name: str
     entry_callable: str
     payload: Dict[str, Any]
+    source_kind: str = SOURCE_KIND_ARTIFACT
     payload_mode: str = "task_submit"
     serialization_mode: str = ""
     use_transport_result: Optional[bool] = None
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
+    invoke_context: Dict[str, Any] = field(default_factory=dict)
     warmup_only: bool = False
 
     def to_payload(self) -> Dict[str, Any]:
@@ -110,11 +114,13 @@ class ExecuteSpec:
             "method_name": self.method_name,
             "entry_callable": self.entry_callable,
             "payload": dict(self.payload or {}),
+            "source_kind": self.source_kind,
             "payload_mode": self.payload_mode,
             "serialization_mode": self.serialization_mode,
             "use_transport_result": self.use_transport_result,
             "managed_globals_scope_dir": self.managed_globals_scope_dir,
             "managed_globals_digest": self.managed_globals_digest,
+            "invoke_context": dict(self.invoke_context or {}),
             "warmup_only": bool(self.warmup_only),
         }
 
@@ -131,6 +137,7 @@ def _build_execute_spec_model(
     use_transport_result: Optional[bool] = None,
     managed_globals_scope_dir: str = "",
     managed_globals_digest: str = "",
+    invoke_context: Optional[Dict[str, Any]] = None,
     warmup_only: bool = False,
 ) -> ExecuteSpec:
     return ExecuteSpec(
@@ -147,11 +154,13 @@ def _build_execute_spec_model(
         method_name=str(method_name),
         entry_callable=str(artifact.entry_callable),
         payload=dict(payload or {}),
+        source_kind=str(getattr(artifact, "source_kind", SOURCE_KIND_ARTIFACT) or SOURCE_KIND_ARTIFACT),
         payload_mode=str(payload_mode or "task_submit"),
         serialization_mode=str(serialization_mode or "").strip().lower(),
         use_transport_result=use_transport_result,
         managed_globals_scope_dir=str(managed_globals_scope_dir or ""),
         managed_globals_digest=str(managed_globals_digest or ""),
+        invoke_context=dict(invoke_context or {}),
         warmup_only=bool(warmup_only),
     )
 
@@ -168,6 +177,7 @@ def _build_execute_spec(
     use_transport_result: Optional[bool] = None,
     managed_globals_scope_dir: str = "",
     managed_globals_digest: str = "",
+    invoke_context: Optional[Dict[str, Any]] = None,
     warmup_only: bool = False,
 ) -> Dict[str, Any]:
     return _build_execute_spec_model(
@@ -181,6 +191,7 @@ def _build_execute_spec(
         use_transport_result=use_transport_result,
         managed_globals_scope_dir=managed_globals_scope_dir,
         managed_globals_digest=managed_globals_digest,
+        invoke_context=invoke_context,
         warmup_only=warmup_only,
     ).to_payload()
 
@@ -578,7 +589,15 @@ def _load_user_module(
     entry_module: str,
     package_format: str,
     dependency_path: str = "",
+    source_kind: str = SOURCE_KIND_ARTIFACT,
 ):
+    normalized_source_kind = str(source_kind or SOURCE_KIND_ARTIFACT).strip().lower()
+    if normalized_source_kind == SOURCE_KIND_MODULE_IMPORT:
+        if not entry_module:
+            raise RuntimeError("entry_module is required for module_import")
+        with _temporary_import_paths(dependency_path, artifact_path):
+            return importlib.import_module(entry_module)
+
     path = _path(artifact_path)
     format_name = _normalize_package_format(package_format, path.name)
 
@@ -767,6 +786,7 @@ def _load_callable_router(
     export_methods: Sequence[str],
     export_decorator: str,
     entry_callable: str,
+    source_kind: str = SOURCE_KIND_ARTIFACT,
 ) -> Tuple[Any, Dict[str, Any], Dict[str, Tuple[str, str]]]:
     mode, methods, decorator = _normalize_export_spec(
         mode=export_mode,
@@ -784,6 +804,7 @@ def _load_callable_router(
             ",".join(methods),
             decorator,
             entry_callable or "",
+            str(source_kind or SOURCE_KIND_ARTIFACT),
         )
     )
     with _ROUTER_CACHE_LOCK:
@@ -796,6 +817,7 @@ def _load_callable_router(
         entry_module=entry_module,
         package_format=package_format,
         dependency_path=dependency_path,
+        source_kind=source_kind,
     )
     loaded = _build_callable_router(
         module,
@@ -820,6 +842,7 @@ def _discover_callable_methods(
     export_methods: Sequence[str],
     export_decorator: str,
     entry_callable: str,
+    source_kind: str = SOURCE_KIND_ARTIFACT,
 ) -> Tuple[Any, Dict[str, Tuple[str, str]]]:
     mode, methods, decorator = _normalize_export_spec(
         mode=export_mode,
@@ -832,6 +855,7 @@ def _discover_callable_methods(
         entry_module=entry_module,
         package_format=package_format,
         dependency_path=dependency_path,
+        source_kind=source_kind,
     )
     try:
         _router, method_info = _build_callable_router(
@@ -1215,7 +1239,9 @@ def _execute_payload_in_subprocess(
     payload_mode: str = "task_submit",
     serialization_mode: str = "",
     use_transport_result: Optional[bool] = None,
+    invoke_context: Optional[Dict[str, Any]] = None,
     stream_queue: Optional[object] = None,
+    source_kind: str = SOURCE_KIND_ARTIFACT,
 ) -> Tuple[str, Optional[dict], str, str, Dict[str, float]]:
     decode_start = time.perf_counter()
     decode_end = decode_start
@@ -1255,6 +1281,7 @@ def _execute_payload_in_subprocess(
                     export_methods=export_methods,
                     export_decorator=export_decorator,
                     entry_callable=entry_callable,
+                    source_kind=source_kind,
                 )
             except Exception as exc:
                 decode_end = time.perf_counter()
@@ -1330,6 +1357,26 @@ def _execute_payload_in_subprocess(
                         policy=payload_policy,
                         resolve_object_refs=lambda value: _resolve_object_refs_in_payload(value, object_dir=object_dir),
                     )
+                    if source_kind == SOURCE_KIND_MODULE_IMPORT and invoke_context:
+                        try:
+                            context_param_names = set(inspect.signature(fn).parameters)
+                        except Exception:
+                            context_param_names = set()
+                        context_value = {
+                            key: value
+                            for key, value in dict(invoke_context).items()
+                            if key in context_param_names
+                        }
+                        if isinstance(resolved_payload, dict) and set(resolved_payload).issubset({"args", "kwargs"}):
+                            resolved_payload = dict(resolved_payload)
+                            resolved_kwargs = dict(resolved_payload.get("kwargs") or {})
+                            for key, value in context_value.items():
+                                resolved_kwargs.setdefault(key, value)
+                            resolved_payload["kwargs"] = resolved_kwargs
+                        elif isinstance(resolved_payload, dict):
+                            resolved_payload = dict(resolved_payload)
+                            for key, value in context_value.items():
+                                resolved_payload.setdefault(key, value)
                     decode_end = time.perf_counter()
                     if bool(warmup_only):
                         invoke_start = decode_end

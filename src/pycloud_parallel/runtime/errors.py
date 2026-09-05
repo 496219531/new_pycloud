@@ -3,6 +3,7 @@ from __future__ import annotations
 """Unified runtime compatibility errors for the V1 migration path."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Sequence
 
 
@@ -16,6 +17,34 @@ class RuntimeMismatchError(PycloudModelError):
 
 class DataRefPayloadError(PycloudModelError):
     """Raised when a payload is not a canonical DataRef payload."""
+
+
+class ExecutionErrorCode(str, Enum):
+    USER_CODE_ERROR = "UserCodeError"
+    DEPENDENCY_ERROR = "DependencyError"
+    WORKER_CRASHED = "WorkerCrashed"
+    EXECUTOR_UNAVAILABLE = "ExecutorUnavailable"
+    CALL_TIMEOUT = "CallTimeout"
+    QUEUE_FULL = "QueueFull"
+    SERIALIZATION_ERROR = "SerializationError"
+
+
+def execution_error_code(status_text: str = "", *, error_type: str = "", error_message: str = "") -> ExecutionErrorCode:
+    status = str(status_text or "").strip().upper()
+    text = f"{error_type} {error_message}".strip().lower()
+    if status == "FAILED_DEPENDENCY" or "dependency" in text or "no module named" in text:
+        return ExecutionErrorCode.DEPENDENCY_ERROR
+    if "timeout" in text or "timed out" in text:
+        return ExecutionErrorCode.CALL_TIMEOUT
+    if "queue" in text and ("full" in text or "capacity" in text):
+        return ExecutionErrorCode.QUEUE_FULL
+    if "serializ" in text or "pickle" in text or "pickl" in text or "codec" in text:
+        return ExecutionErrorCode.SERIALIZATION_ERROR
+    if "brokenprocesspool" in text or "worker" in text and ("died" in text or "crash" in text):
+        return ExecutionErrorCode.WORKER_CRASHED
+    if status == "FAILED_INFRA" or "executor" in text or "unavailable" in text:
+        return ExecutionErrorCode.EXECUTOR_UNAVAILABLE
+    return ExecutionErrorCode.USER_CODE_ERROR
 
 
 @dataclass(frozen=True)

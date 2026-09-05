@@ -66,6 +66,8 @@ def _pid_alive(pid: int) -> bool:
 
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     os.environ["PYCLOUD_EXECUTOR_PARENT_KIND"] = "executor_host"
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     def _emit(item: Dict[str, Any]) -> None:
         event_q.put(dict(item))
@@ -401,6 +403,18 @@ class ExecutorHostClient:
                     if _pid_alive(int(pid)):
                         alive += 1
                 out[(resource_kind, resource_id)] = alive
+        return out
+
+    def resource_worker_pids(self) -> Dict[Tuple[str, str], Tuple[int, ...]]:
+        out: Dict[Tuple[str, str], Tuple[int, ...]] = {}
+        with self._cv:
+            for worker_key, pid_set in self._worker_pid_sets.items():
+                if ":" not in worker_key:
+                    continue
+                scope, resource_id = worker_key.split(":", 1)
+                resource_kind = "service" if scope == "service" else "task_pool" if scope == "pool" else ""
+                if resource_kind:
+                    out[(resource_kind, resource_id)] = tuple(sorted(int(pid) for pid in pid_set if _pid_alive(int(pid))))
         return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:

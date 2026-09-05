@@ -258,6 +258,7 @@ class JobOrchestratorServer:
             node_id=self.node_id,
             service_id=self.service_id,
             worker_count=1,
+            worker_backend="inline",
             policy_id=self.job_orch_policy_id,
             package_format="module",
             managed_global_names=JOB_ORCHESTRATOR_MANAGED_GLOBALS,

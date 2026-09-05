@@ -284,6 +284,8 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 4. `put_data(..., object_format="bin")` 是推荐写法；旧的 `format="bin"` 仍兼容，但它表示 object-store format hint，不是 Python 字符串格式化语义
 5. local TaskPool 的 `submit_payloads(...)` / `put_data(...)` 同样固定 `pickle_native_v1`
 6. carrier decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
+7. local TaskPool 的 module/callable/artifact 路径统一使用 `NodeControlState -> ExecutorHost -> ProcessPoolExecutor`；`worker_count` 表示真实计算进程数，不是线程数
+8. local TaskPool 的 callable 必须是可 import 的 module-level callable；嵌套函数、闭包和 lambda 不再依赖父进程线程执行，应移动到模块中或改传 `source=module`
 
 ### 4.1 DataRef 默认链路
 

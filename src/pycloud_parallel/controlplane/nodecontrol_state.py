@@ -45,6 +45,7 @@ from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
 from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
 from pycloud_parallel.controlplane.node.execution import (
+    SOURCE_KIND_MODULE_IMPORT,
     _build_execute_spec,
     _describe_artifact_error,
     _discover_callable_methods,
@@ -155,7 +156,7 @@ from pycloud_parallel.controlplane.resource_signals import (
 )
 from pycloud_parallel.execution.dependency_failover import dependency_failure_reason, dependency_missing_module
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.runtime.errors import normalize_invoke_error
+from pycloud_parallel.runtime.errors import execution_error_code, normalize_invoke_error
 from pycloud_parallel.runtime.executors import _shutdown_executor
 
 
@@ -1948,6 +1949,7 @@ class NodeControlState(NodeRuntimeBase):
                     "export_methods": list(artifact.export_methods),
                     "export_decorator": artifact.export_decorator,
                     "entry_callable": artifact.entry_callable,
+                    "source_kind": artifact.source_kind,
                     "managed_global_names": list(managed_global_names or ()),
                     "prepare_scope": str(prepare_scope or ""),
                     "prepare_key": str(prepare_key or ""),
@@ -2029,6 +2031,7 @@ class NodeControlState(NodeRuntimeBase):
                 export_methods=artifact.export_methods,
                 export_decorator=artifact.export_decorator,
                 entry_callable=artifact.entry_callable,
+                source_kind=artifact.source_kind,
             )
             self._validate_managed_global_names(managed_global_names, module=module)
             return methods
@@ -2308,6 +2311,7 @@ class NodeControlState(NodeRuntimeBase):
         return self.task_pool(pool_id)
 
     def task_pool_status_info(self, pool_id: str) -> Dict[str, object]:
+        self._drain_executor_events()
         pool = self.task_pool(pool_id)
         inflight = 0
         with self._lock:
@@ -3107,6 +3111,7 @@ class NodeControlState(NodeRuntimeBase):
         service_id: str = "",
         create_request_id: str = "",
         wait_ready: bool = True,
+        local_artifact: Optional[CodeArtifact] = None,
     ) -> ServiceSession:
         if not self.can_accept_service_deploy:
             reason = self.deploy_health_reason or "service deploy is disabled"
@@ -3143,6 +3148,8 @@ class NodeControlState(NodeRuntimeBase):
             },
         )
         normalized_create_request_id = str(create_request_id or "").strip()
+        if local_artifact is not None and not wait_ready:
+            raise ValueError("local module service creation requires wait_ready=True")
         should_create = True
         if normalized_create_request_id:
             with self._cv:
@@ -3183,6 +3190,7 @@ class NodeControlState(NodeRuntimeBase):
                 service_name=effective_service_name,
                 code_version=str(sha256 or ""),
                 worker_count=requested_workers,
+                requested_workers=requested_workers,
                 heartbeat_timeout_sec=actual_hb_timeout,
                 idle_ttl_sec=actual_idle_ttl,
                 expose_http=bool(expose_http),
@@ -3250,21 +3258,27 @@ class NodeControlState(NodeRuntimeBase):
             return session
 
         try:
-            artifact, cached_artifact = self.put_code(
-                client_id=owner_client_id,
-                sha256=sha256,
-                runtime=runtime,
-                entry_module=entry_module,
-                entry_callable=entry_callable,
-                package_format=package_format,
-                export_mode=export_mode,
-                export_methods=export_methods,
-                export_decorator=export_decorator,
-                dependency_policy_mode=dependency_policy_mode,
-                dependency_allowlist=dependency_allowlist,
-                chunks=chunks,
-                validate_load=False,
-            )
+            if local_artifact is not None:
+                artifact = local_artifact
+                cached_artifact = True
+                with self._lock:
+                    self._codes[artifact.code_version] = artifact
+            else:
+                artifact, cached_artifact = self.put_code(
+                    client_id=owner_client_id,
+                    sha256=sha256,
+                    runtime=runtime,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                    export_mode=export_mode,
+                    export_methods=export_methods,
+                    export_decorator=export_decorator,
+                    dependency_policy_mode=dependency_policy_mode,
+                    dependency_allowlist=dependency_allowlist,
+                    chunks=chunks,
+                    validate_load=False,
+                )
             method_info = self._ensure_artifact_ready(
                 artifact,
                 dependency_policy_mode=dependency_policy_mode,
@@ -3382,6 +3396,7 @@ class NodeControlState(NodeRuntimeBase):
                 service_name=effective_service_name,
                 code_version=artifact.code_version,
                 worker_count=actual_workers,
+                requested_workers=requested_workers,
                 heartbeat_timeout_sec=actual_hb_timeout,
                 idle_ttl_sec=actual_idle_ttl,
                 expose_http=bool(expose_http),
@@ -4046,6 +4061,7 @@ class NodeControlState(NodeRuntimeBase):
                 code_version=str(sha256 or ""),
                 task_method=str(entry_callable or "run").strip() or "run",
                 worker_count=requested_workers,
+                requested_workers=requested_workers,
                 heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
                 idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
                 pool_token=token,
@@ -4235,6 +4251,7 @@ class NodeControlState(NodeRuntimeBase):
                 code_version=artifact.code_version,
                 task_method=str(entry_callable or "run").strip() or "run",
                 worker_count=actual_workers,
+                requested_workers=requested_workers,
                 heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
                 idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
                 pool_token=token,
@@ -4910,6 +4927,17 @@ class NodeControlState(NodeRuntimeBase):
                 use_transport_result=use_transport_result,
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
                 managed_globals_digest=session.managed_globals_digest,
+                invoke_context=(
+                    {
+                        "_service_id": service_id,
+                        "_service_token": service_token,
+                        "_timeout_sec": timeout_sec,
+                        "_serialization_mode": str(serialization_mode or "").strip().lower(),
+                        "_use_transport_result": use_transport_result,
+                    }
+                    if artifact.source_kind == SOURCE_KIND_MODULE_IMPORT
+                    else None
+                ),
             )
             build_end = time.perf_counter()
             build_execute_spec_ms = (build_end - build_start) * 1000.0
@@ -4949,7 +4977,11 @@ class NodeControlState(NodeRuntimeBase):
                         error_type="Timeout",
                         error_message="invoke timeout",
                     )
-            return 504, {"ok": False, "error": "invoke timeout"}
+            return 504, {
+                "ok": False,
+                "error_code": execution_error_code("FAILED_INFRA", error_type="Timeout").value,
+                "error": "invoke timeout",
+            }
         except Exception as exc:
             with self._lock:
                 session = self._services.get(service_id)
@@ -4977,7 +5009,15 @@ class NodeControlState(NodeRuntimeBase):
                     )
                     if stopped_payload is not None:
                         return 409, stopped_payload
-            return 500, {"ok": False, "error": repr(exc)}
+            return 500, {
+                "ok": False,
+                "error_code": execution_error_code(
+                    "FAILED_INFRA",
+                    error_type=exc.__class__.__name__,
+                    error_message=str(exc),
+                ).value,
+                "error": repr(exc),
+            }
 
         with self._lock:
             session = self._services.get(service_id)
@@ -5038,6 +5078,11 @@ class NodeControlState(NodeRuntimeBase):
             return 400, {
                 "ok": False,
                 "method": requested_method,
+                "error_code": execution_error_code(
+                    status_text,
+                    error_type=normalized_error_type,
+                    error_message=normalized_error_message,
+                ).value,
                 "error_type": normalized_error_type,
                 "error": normalized_error_message,
             }
@@ -5075,6 +5120,11 @@ class NodeControlState(NodeRuntimeBase):
             return 503, {
                 "ok": False,
                 "method": requested_method,
+                "error_code": execution_error_code(
+                    status_text,
+                    error_type=normalized_error_type,
+                    error_message=normalized_error_message,
+                ).value,
                 "error_type": normalized_error_type,
                 "error": normalized_error_message,
             }
@@ -5106,6 +5156,11 @@ class NodeControlState(NodeRuntimeBase):
         return 503, {
             "ok": False,
             "method": requested_method,
+            "error_code": execution_error_code(
+                status_text,
+                error_type=normalized_error_type,
+                error_message=normalized_error_message,
+            ).value,
             "error_type": normalized_error_type,
             "error": normalized_error_message,
         }
@@ -5194,6 +5249,17 @@ class NodeControlState(NodeRuntimeBase):
                 use_transport_result=use_transport_result,
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
                 managed_globals_digest=session.managed_globals_digest,
+                invoke_context=(
+                    {
+                        "_service_id": service_id,
+                        "_service_token": service_token,
+                        "_timeout_sec": timeout_sec,
+                        "_serialization_mode": str(serialization_mode or "").strip().lower(),
+                        "_use_transport_result": use_transport_result,
+                    }
+                    if artifact.source_kind == SOURCE_KIND_MODULE_IMPORT
+                    else None
+                ),
             )
             build_end = time.perf_counter()
         except Exception as exc:
@@ -5604,6 +5670,7 @@ class NodeControlState(NodeRuntimeBase):
         return 200, {"ok": True, "service_id": str(service_id or ""), "methods": methods}
 
     def service_status_info(self, service_id: str) -> Dict[str, object]:
+        self._drain_executor_events()
         with self._lock:
             session = self._services.get(service_id)
             if session is None:
@@ -5912,15 +5979,36 @@ class NodeControlState(NodeRuntimeBase):
                         str(item.get("traceback", "") or ""),
                     )
                     continue
+                if kind == "executor_worker_pids":
+                    scope = str(item.get("scope", "") or "")
+                    resource_id = str(item.get("key", "") or "")
+                    worker_pids = tuple(sorted(int(pid) for pid in item.get("worker_pids", ()) if int(pid) > 0))
+                    if scope == "service":
+                        resource = self._services.get(resource_id)
+                    elif scope == "pool":
+                        resource = self._task_pools.get(resource_id)
+                    else:
+                        resource = None
+                    if resource is not None:
+                        resource.worker_pids = worker_pids
+                        resource.alive_workers = len(worker_pids)
+                    continue
                 if kind == "pool_executor_rebuilt":
                     pool_id = str(item.get("pool_id", "") or "")
                     pool = self._task_pools.get(pool_id)
                     if pool is not None:
+                        pool.executor_generation = max(1, int(pool.executor_generation or 0)) + 1
                         self._increment_task_pool_metric_locked(
                             pool,
                             key="executor_rebuild_count",
                             delta=max(1, int(item.get("recoveries", 1) or 1)),
                         )
+                    continue
+                if kind == "service_executor_rebuilt":
+                    service_id = str(item.get("service_id", "") or "")
+                    session = self._services.get(service_id)
+                    if session is not None:
+                        session.executor_generation = max(1, int(session.executor_generation or 0)) + 1
                     continue
                 if str(item.get("kind", "") or "") == "pool_task_done":
                     pool_id = str(item.get("pool_id", "") or "")

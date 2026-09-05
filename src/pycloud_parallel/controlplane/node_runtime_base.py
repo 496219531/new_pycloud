@@ -86,6 +86,10 @@ class StaticServiceMount:
     failure_at: Optional[datetime] = None
     status_payload: Dict[str, object] = field(default_factory=dict)
     mounted_at_monotonic: float = field(default_factory=time.monotonic)
+    execution_gate: Any = field(default=None, repr=False)
+    execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    queued: int = 0
+    in_flight: int = 0
 
 
 class NodeRuntimeBase:
@@ -147,6 +151,7 @@ class NodeRuntimeBase:
             managed_global_names=tuple(str(name).strip() for name in (managed_global_names or ()) if str(name).strip()),
         )
         mount.http_base_url = f"{self.service_http_base_url}/svc/{mount.service_id}" if self.service_http_base_url else ""
+        mount.execution_gate = threading.BoundedSemaphore(mount.worker_count)
         self._startup_services[normalized_service_id] = mount
         mount.alive_workers = int(mount.worker_count)
         self._apply_pending_startup_globals(mount)
@@ -865,7 +870,14 @@ class NodeRuntimeBase:
 
     def metrics(self) -> Dict[str, int]:
         capacity = self.service_worker_capacity
-        return {"queued": 0, "inflight": 0, "running": 0, "credit": capacity}
+        queued = sum(max(0, int(mount.queued or 0)) for mount in self._startup_services.values())
+        running = sum(max(0, int(mount.in_flight or 0)) for mount in self._startup_services.values())
+        return {
+            "queued": queued,
+            "inflight": running,
+            "running": running,
+            "credit": max(0, capacity - running),
+        }
 
     def startup_service_report_payloads(self) -> List[Dict[str, object]]:
         if self._closed.is_set():
@@ -882,8 +894,13 @@ class NodeRuntimeBase:
                     "status": int(status_info["status"]),
                     "status_text": str(status_info["status_text"]),
                     "worker_count": int(mount.worker_count),
+                    "requested_workers": int(mount.worker_count),
                     "alive_workers": int(status_info["alive_workers"]),
-                    "in_flight": 0,
+                    "busy_workers": min(int(status_info["alive_workers"]), max(0, int(mount.in_flight or 0))),
+                    "queued": max(0, int(mount.queued or 0)),
+                    "worker_pids": [os.getpid()],
+                    "executor_generation": 1,
+                    "in_flight": max(0, int(mount.in_flight or 0)),
                     "lease_expire_at": lease_expire_at,
                     "http_base_url": mount.http_base_url,
                     "policy_id": mount.policy_id,
@@ -922,6 +939,26 @@ class NodeRuntimeBase:
     def _mounted_service(self, service_id: str) -> Optional[StaticServiceMount]:
         return self._startup_services.get(str(service_id or "").strip())
 
+    @staticmethod
+    def _acquire_startup_service_slot(mount: StaticServiceMount, *, timeout_sec: float) -> bool:
+        with mount.execution_lock:
+            mount.queued += 1
+        try:
+            acquired = bool(mount.execution_gate.acquire(timeout=max(0.0, float(timeout_sec or 0.0))))
+        finally:
+            with mount.execution_lock:
+                mount.queued = max(0, mount.queued - 1)
+        if acquired:
+            with mount.execution_lock:
+                mount.in_flight += 1
+        return acquired
+
+    @staticmethod
+    def _release_startup_service_slot(mount: StaticServiceMount) -> None:
+        with mount.execution_lock:
+            mount.in_flight = max(0, mount.in_flight - 1)
+        mount.execution_gate.release()
+
     def _invoke_mounted_startup_service(
         self,
         service_id: str,
@@ -936,15 +973,59 @@ class NodeRuntimeBase:
         mount = self._mounted_service(service_id)
         if mount is None:
             return 404, {"ok": False, "error": "service not found"}
-        return mount.invoke_handler(
-            method,
-            payload,
-            service_token,
-            timeout_sec,
-            serialization_mode,
-            use_transport_result,
-            stream_response,
-        )
+        if not self._acquire_startup_service_slot(mount, timeout_sec=timeout_sec):
+            return 504, {"ok": False, "error": "inline service worker wait timed out"}
+        try:
+            response = mount.invoke_handler(
+                method,
+                payload,
+                service_token,
+                timeout_sec,
+                serialization_mode,
+                use_transport_result,
+                stream_response,
+            )
+        except BaseException:
+            self._release_startup_service_slot(mount)
+            raise
+        if isinstance(response, StreamingHttpResponse):
+            body_iter = response.body_iter
+
+            def _bounded_body_iter():
+                try:
+                    yield from body_iter
+                finally:
+                    self._release_startup_service_slot(mount)
+
+            response.body_iter = _bounded_body_iter()
+            return response
+        self._release_startup_service_slot(mount)
+        return response
+
+    def _iter_mounted_startup_service(
+        self,
+        service_id: str,
+        method: str,
+        payload: dict,
+        service_token: str,
+        timeout_sec: float,
+        serialization_mode: str,
+    ):
+        mount = self._mounted_service(service_id)
+        if mount is None or not callable(mount.stream_handler):
+            raise RuntimeError("startup service stream handler not found")
+        if not self._acquire_startup_service_slot(mount, timeout_sec=timeout_sec):
+            raise TimeoutError("inline service worker wait timed out")
+        try:
+            yield from mount.stream_handler(
+                method,
+                payload,
+                service_token,
+                timeout_sec,
+                serialization_mode,
+            )
+        finally:
+            self._release_startup_service_slot(mount)
 
     def _status_mounted_startup_service(self, service_id: str) -> Tuple[int, Dict[str, object]]:
         mount = self._mounted_service(service_id)

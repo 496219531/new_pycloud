@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import hashlib
 import importlib
 import inspect
 import io
@@ -24,7 +25,6 @@ from urllib.parse import urlparse
 
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
-    ArtifactDeps,
     ArtifactExports,
     _default_artifact_filename,
     _default_entry_module_for_func,
@@ -54,6 +54,8 @@ from pycloud_parallel.controlplane.node_control_transport import (
     node_control_client as _node_control_client,
     node_control_target_for_node as _node_control_target_for_node,
 )
+from pycloud_parallel.controlplane.node.execution import SOURCE_KIND_MODULE_IMPORT
+from pycloud_parallel.controlplane.node.models import CodeArtifact
 from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
@@ -149,6 +151,69 @@ _STARTUP_PREFLIGHT_RETRY_SEC = 5.0
 _STARTUP_PREFLIGHT_SLEEP_SEC = 0.2
 _LOCAL_SERVICE_EXECUTOR_POLL_INTERVAL_SEC = 0.25
 _CONNECTED_SERVICE_OWNER_ONLY_METHODS = frozenset({"update_globals"})
+
+
+def _prepare_local_module_import_artifact(
+    module: Any,
+    *,
+    runtime: str,
+    export_methods: Optional[Sequence[str]],
+    managed_global_names: Sequence[str],
+) -> CodeArtifact:
+    module_name = str(getattr(module, "__name__", "") or "").strip()
+    if not module_name or module_name == "__main__":
+        raise ValueError("startup module must be importable by name in worker processes")
+    method_names = tuple(str(name).strip() for name in (export_methods or ()) if str(name).strip())
+    if not method_names:
+        method_names = tuple(
+            name
+            for name, value in vars(module).items()
+            if not name.startswith("_") and callable(value)
+        )
+    missing = [name for name in method_names if not callable(getattr(module, name, None))]
+    if missing:
+        raise ValueError(f"startup module exports are not callable: {missing}")
+    if not method_names:
+        raise ValueError(f"no callable service methods found in module {module_name!r}")
+
+    module_file = str(getattr(module, "__file__", "") or "").strip()
+    if not module_file:
+        raise ValueError(f"startup module has no local file: {module_name!r}")
+    module_path = Path(module_file).expanduser().resolve()
+    import_root = module_path.parent
+    levels = len(module_name.split(".")) if module_path.name == "__init__.py" else len(module_name.split(".")) - 1
+    for _ in range(max(0, levels)):
+        import_root = import_root.parent
+    descriptor = json.dumps(
+        {
+            "source_kind": SOURCE_KIND_MODULE_IMPORT,
+            "entry_module": module_name,
+            "import_root": str(import_root),
+            "export_methods": method_names,
+            "managed_global_names": tuple(str(name) for name in managed_global_names or ()),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(descriptor).hexdigest()
+    return CodeArtifact(
+        code_version=f"sha256:{digest}.module-import",
+        path=str(import_root),
+        runtime=str(runtime or "py3").strip() or "py3",
+        entry_module=module_name,
+        entry_callable=method_names[0],
+        package_format="module",
+        export_mode="explicit",
+        export_methods=method_names,
+        export_decorator=_DEFAULT_EXPORT_DECORATOR,
+        dependency_policy_mode="node_preinstalled",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=0,
+        created_at=datetime.now(timezone.utc),
+        source_kind=SOURCE_KIND_MODULE_IMPORT,
+    )
 
 
 def _infocenter_client(*args, **kwargs):
@@ -2868,6 +2933,7 @@ class Service(ServiceExecutionSession):
         service_http_base_url: str = "",
         service_id: str = "",
         worker_count: int = 1,
+        worker_backend: str = "process",
         policy_id: str = "",
         runtime: str = "py3",
         package_format: str = "module",
@@ -2885,8 +2951,9 @@ class Service(ServiceExecutionSession):
         """Product-facing startup-mounted service action.
 
         This path is module-first: prefer passing a live Python module object
-        (or `package_format="module"`) so startup can mount it directly and
-        keep local behavior close to the runtime service shape.
+        (or `package_format="module"`). Business source stays local while the
+        default process workers import it by name. Use ``worker_backend="inline"``
+        only for controller services that must share owner-process state.
 
         Use `deploy()` when you want the upload/artifact path instead.
         """
@@ -2908,8 +2975,24 @@ class Service(ServiceExecutionSession):
         direct_module_mount = normalized_package_format == "module" or (
             normalized_package_format == "" and inspect.ismodule(source)
         )
-        prepared_artifact = None
-        if not direct_module_mount:
+        normalized_worker_backend = str(worker_backend or "process").strip().lower()
+        if normalized_worker_backend not in {"process", "inline"}:
+            raise ValueError("worker_backend must be 'process' or 'inline'")
+        if normalized_worker_backend == "inline" and not direct_module_mount:
+            raise ValueError("worker_backend='inline' requires package_format='module'")
+        inline_module_mount = direct_module_mount and normalized_worker_backend == "inline"
+        local_module_artifact = None
+        if direct_module_mount and not inline_module_mount:
+            module_source = source
+            if module_source is None or isinstance(module_source, str):
+                module_source = importlib.import_module(module_name)
+            local_module_artifact = _prepare_local_module_import_artifact(
+                module_source,
+                runtime=runtime,
+                export_methods=export_methods,
+                managed_global_names=effective_managed_global_names,
+            )
+        elif not inline_module_mount:
             artifact_source = source
             if artifact_source is None or isinstance(artifact_source, str):
                 artifact_source = importlib.import_module(module_name)
@@ -2937,7 +3020,7 @@ class Service(ServiceExecutionSession):
             )
             while True:
                 try:
-                    if direct_module_mount:
+                    if inline_module_mount:
                         startup_node.start_mounted_service_gateway()
                     else:
                         startup_node.start_node_service_gateway()
@@ -3032,7 +3115,7 @@ class Service(ServiceExecutionSession):
             _preflight_existing_startup_service()
             if start and not local_mode:
                 _bind_startup_gateway(node)
-            if direct_module_mount:
+            if inline_module_mount:
                 node.mount_python_module_service(
                     service_name=effective_service_name,
                     entry_module=module_name,
@@ -3044,6 +3127,20 @@ class Service(ServiceExecutionSession):
                 )
                 if initial_globals_values:
                     node.update_globals(initial_globals_values, service_id=service_id, service_name=effective_service_name)
+            elif local_module_artifact is not None:
+                node.mount_local_module_service(
+                    artifact=local_module_artifact,
+                    owner_client_id=f"{effective_node_id}-owner",
+                    service_name=effective_service_name,
+                    managed_global_names=effective_managed_global_names,
+                    initial_globals=initial_globals_values,
+                    policy_id=policy_id or (get_default_policy_id_for_binding("service_internal") if local_mode else ""),
+                    worker_count=effective_worker_count,
+                    heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
+                    idle_ttl_sec=0,
+                    expose_http=bool(start and not local_mode),
+                    service_id=service_id,
+                )
             else:
                 node.mount_prepared_service(
                     owner_client_id=f"{effective_node_id}-owner",
@@ -3136,21 +3233,32 @@ class Service(ServiceExecutionSession):
             entry_module = _default_entry_module_for_module(module_source)
             package_format = _resolve_package_format(package_format, module_filename, default="py")
 
-        normalized_artifact = _normalize_artifact_input(
-            consumer_kind="service",
-            source=source,
-            artifact=artifact,
-            deps=deps,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            exports=ArtifactExports.explicit(export_methods) if export_methods else None,
-            managed_global_names=effective_managed_global_names,
-        )
-        prepared_artifact = None if direct_module_mount else _prepare_artifact(normalized_artifact, consumer_kind="service")
+        if direct_module_mount:
+            direct_module = module_source or importlib.import_module(direct_module_name)
+            local_module_artifact = _prepare_local_module_import_artifact(
+                direct_module,
+                runtime=runtime,
+                export_methods=export_methods,
+                managed_global_names=effective_managed_global_names,
+            )
+            prepared_artifact = None
+        else:
+            local_module_artifact = None
+            normalized_artifact = _normalize_artifact_input(
+                consumer_kind="service",
+                source=source,
+                artifact=artifact,
+                deps=deps,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                exports=ArtifactExports.explicit(export_methods) if export_methods else None,
+                managed_global_names=effective_managed_global_names,
+            )
+            prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="service")
         effective_entry_module = direct_module_name
-        if prepared_artifact is not None:
+        if not direct_module_mount:
             effective_entry_module = prepared_artifact.entry_module
             if not effective_entry_module and prepared_artifact.filename.endswith(".py"):
                 effective_entry_module = Path(prepared_artifact.filename).stem
@@ -3172,19 +3280,19 @@ class Service(ServiceExecutionSession):
             service_default_worker_count=effective_worker_count,
         )
         try:
-            if direct_module_mount:
-                node.mount_python_module_service(
+            if local_module_artifact is not None:
+                node.mount_local_module_service(
+                    artifact=local_module_artifact,
+                    owner_client_id=effective_owner,
                     service_name=effective_service_name,
-                    entry_module=effective_entry_module,
-                    export_methods=export_methods,
-                    worker_count=effective_worker_count,
-                    policy_id=get_default_policy_id_for_binding("service_internal"),
                     managed_global_names=effective_managed_global_names,
+                    initial_globals=initial_globals_values,
+                    policy_id=get_default_policy_id_for_binding("service_internal"),
+                    worker_count=effective_worker_count,
+                    heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+                    idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+                    expose_http=False,
                 )
-                node._local_owner_client_id = effective_owner  # noqa: SLF001
-                node._local_code_version = f"module:{effective_entry_module}"  # noqa: SLF001
-                if initial_globals_values:
-                    node.update_globals(initial_globals_values, service_name=effective_service_name)
             else:
                 node.mount_prepared_service(
                     owner_client_id=effective_owner,

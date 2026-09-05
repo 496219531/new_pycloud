@@ -4,7 +4,13 @@ import pytest
 
 from pycloud_parallel.controlplane.node.execution import _validate_python_runtime_or_raise
 from pycloud_parallel.data.ref import coerce_data_ref
-from pycloud_parallel.runtime.errors import DataRefPayloadError, RuntimeMismatchError, normalize_invoke_error
+from pycloud_parallel.runtime.errors import (
+    DataRefPayloadError,
+    ExecutionErrorCode,
+    RuntimeMismatchError,
+    execution_error_code,
+    normalize_invoke_error,
+)
 
 
 def test_runtime_mismatch_uses_shared_runtime_error_type():
@@ -63,3 +69,12 @@ def test_invoke_error_normalization_is_shared():
     assert ok is True
     assert error_type == ""
     assert error_message == ""
+
+
+def test_execution_error_code_normalizes_runtime_failures():
+    assert execution_error_code("FAILED_USER", error_type="ValueError") == ExecutionErrorCode.USER_CODE_ERROR
+    assert execution_error_code("FAILED_DEPENDENCY", error_type="ModuleNotFoundError") == ExecutionErrorCode.DEPENDENCY_ERROR
+    assert execution_error_code("FAILED_INFRA", error_type="BrokenProcessPool") == ExecutionErrorCode.WORKER_CRASHED
+    assert execution_error_code("FAILED_INFRA", error_type="Timeout") == ExecutionErrorCode.CALL_TIMEOUT
+    assert execution_error_code("FAILED_INFRA", error_message="queue capacity exhausted") == ExecutionErrorCode.QUEUE_FULL
+    assert execution_error_code("FAILED_USER", error_type="PicklingError") == ExecutionErrorCode.SERIALIZATION_ERROR

@@ -433,6 +433,7 @@ def _code_artifact_from_meta(meta: Dict[str, Any]) -> CodeArtifact:
         dependency_path=dependency_path,
         size_bytes=max(0, int(meta.get("size_bytes", 0) or 0)),
         created_at=_parse_timestamp_or_now(meta.get("created_at")),
+        source_kind=str(meta.get("source_kind", "artifact") or "artifact"),
     )
 
 
@@ -456,6 +457,7 @@ def _write_code_index(base_dir: Path, artifact: CodeArtifact, *, created_at: str
     )
     payload = {
         "code_version": artifact.code_version,
+        "source_kind": artifact.source_kind,
         "entry_module": artifact.entry_module,
         "entry_callable": artifact.entry_callable,
         "package_format": artifact.package_format,
